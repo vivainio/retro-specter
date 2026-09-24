@@ -3,6 +3,7 @@ mod complexity;
 mod git;
 mod pr;
 mod report;
+mod structure;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
@@ -46,6 +47,11 @@ struct Cli {
     /// Show per-file rows (table) or one row per file (csv).
     #[arg(long)]
     files: bool,
+
+    /// Show added/removed/modified functions and classes under each file (table),
+    /// or one row per changed function (csv). Implies --files.
+    #[arg(long)]
+    functions: bool,
 
     /// Only analyze files under this path prefix (repeatable).
     #[arg(long = "path", value_name = "PREFIX")]
@@ -179,10 +185,17 @@ fn run() -> Result<()> {
         .filter(|r| cli.include_empty || !r.files.is_empty())
         .collect();
 
+    let detail = if cli.functions {
+        report::Detail::Function
+    } else if cli.files {
+        report::Detail::File
+    } else {
+        report::Detail::Pr
+    };
     let mut out = BufWriter::new(io::stdout().lock());
     match cli.format {
-        Format::Table => report::table(&mut out, &results, cli.files, cli.top)?,
-        Format::Csv => report::csv(&mut out, &results, cli.files)?,
+        Format::Table => report::table(&mut out, &results, detail, cli.top)?,
+        Format::Csv => report::csv(&mut out, &results, detail)?,
         Format::Json => {
             serde_json::to_writer_pretty(&mut out, &results)?;
             writeln!(out)?;
