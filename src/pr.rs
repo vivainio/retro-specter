@@ -76,6 +76,7 @@ mod tests {
             id: String::new(),
             parents: vec![],
             author: String::new(),
+            email: String::new(),
             date: String::new(),
             subject: subject.into(),
             body: body.into(),

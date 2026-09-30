@@ -49,7 +49,6 @@ pub struct Row {
     pub branch: Option<String>,
     pub author: String,
     pub date: String,
-    pub subject: String,
     /// Commits in the row (1 unless it's a PR).
     pub commits: u32,
     /// Lines added / removed, all file types. For a PR this is its net change against the
@@ -92,12 +91,12 @@ pub fn rows(records: &[Record], unit: Unit) -> Vec<Row> {
     let commit_row = |c: &CommitRec, kind| Row {
         churn_added: c.added,
         churn_removed: c.removed,
-        ai_added: if ai::detect(&c.message).is_empty() {
+        ai_added: if c.ai_models.is_empty() && c.ai_tools.is_empty() {
             0
         } else {
             c.added
         },
-        ai_removed: if ai::detect(&c.message).is_empty() {
+        ai_removed: if c.ai_models.is_empty() && c.ai_tools.is_empty() {
             0
         } else {
             c.removed
@@ -109,11 +108,15 @@ pub fn rows(records: &[Record], unit: Unit) -> Vec<Row> {
         branch: c.branch.clone(),
         author: c.author.clone(),
         date: c.date.clone(),
-        subject: c.subject.clone(),
         commits: 1,
         added: c.added,
         removed: c.removed,
-        ai: ai::combine([(c.message.as_str(), c.added, c.removed)]),
+        ai: ai::combine([(
+            c.ai_models.as_slice(),
+            c.ai_tools.as_slice(),
+            c.added,
+            c.removed,
+        )]),
     };
     if unit == Unit::Commit {
         return records
@@ -142,11 +145,18 @@ pub fn rows(records: &[Record], unit: Unit) -> Vec<Row> {
                 let ms = members
                     .get(&(p.repo.as_str(), p.sha.as_str()))
                     .map_or(&[][..], Vec::as_slice);
-                // An empty merge has no commits of its own; its message is all there is.
+                // An empty merge has no commits of its own; its own message credits are all there is.
                 let ai = if ms.is_empty() {
-                    ai::combine([(p.message.as_str(), 0, 0)])
+                    ai::combine([(p.ai_models.as_slice(), p.ai_tools.as_slice(), 0, 0)])
                 } else {
-                    ai::combine(ms.iter().map(|c| (c.message.as_str(), c.added, c.removed)))
+                    ai::combine(ms.iter().map(|c| {
+                        (
+                            c.ai_models.as_slice(),
+                            c.ai_tools.as_slice(),
+                            c.added,
+                            c.removed,
+                        )
+                    }))
                 };
                 let churn_added: u64 = ms.iter().map(|c| c.added).sum();
                 let churn_removed: u64 = ms.iter().map(|c| c.removed).sum();
@@ -162,7 +172,6 @@ pub fn rows(records: &[Record], unit: Unit) -> Vec<Row> {
                     branch: p.branch.clone(),
                     author: p.author.clone(),
                     date: p.date.clone(),
-                    subject: p.subject.clone(),
                     commits: ms.len() as u32,
                     added: p.added,
                     removed: p.removed,
@@ -202,7 +211,7 @@ pub fn table(out: &mut impl Write, rows: &[Row], unit: Unit, detail: bool) -> io
             .join(" | ");
             writeln!(
                 out,
-                "{:<20}  {:<10}  {:>14}  {:<9}  {:>7}  {:>7}  {:>7}  {:<40}  {}",
+                "{:<20}  {:<10}  {:>14}  {:<9}  {:>7}  {:>7}  {:>7}  {}",
                 trunc(&r.repo, 20),
                 r.date.get(..10).unwrap_or(&r.date),
                 match (r.kind, r.pr, &r.branch) {
@@ -215,8 +224,7 @@ pub fn table(out: &mut impl Write, rows: &[Row], unit: Unit, detail: bool) -> io
                 r.added,
                 r.removed,
                 r.ai_added,
-                trunc(&ai, 40),
-                trunc(&r.subject, 60)
+                trunc(&ai, 40)
             )?;
         }
         writeln!(out)?;
@@ -423,7 +431,7 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
 pub fn csv(out: &mut impl Write, rows: &[Row]) -> io::Result<()> {
     writeln!(
         out,
-        "kind,repo,date,pr,branch,commit,author,commits,ai_commits,lines_added,lines_removed,churn_added,churn_removed,ai_lines_added,ai_lines_removed,ai_models,ai_model_commits,ai_tools,ai_tool_commits,subject"
+        "kind,repo,date,pr,branch,commit,author,commits,ai_commits,lines_added,lines_removed,churn_added,churn_removed,ai_lines_added,ai_lines_removed,ai_models,ai_model_commits,ai_tools,ai_tool_commits"
     )?;
     let names = |l: &[Credit]| {
         l.iter()
@@ -440,7 +448,7 @@ pub fn csv(out: &mut impl Write, rows: &[Row]) -> io::Result<()> {
     for r in rows {
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.kind.name(),
             esc(&r.repo),
             r.date,
@@ -459,8 +467,7 @@ pub fn csv(out: &mut impl Write, rows: &[Row]) -> io::Result<()> {
             esc(&names(&r.ai.models)),
             counts(&r.ai.models),
             esc(&names(&r.ai.tools)),
-            counts(&r.ai.tools),
-            esc(&r.subject)
+            counts(&r.ai.tools)
         )?;
     }
     Ok(())

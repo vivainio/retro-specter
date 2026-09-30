@@ -14,6 +14,7 @@ pub struct Commit {
     pub id: String,
     pub parents: Vec<String>,
     pub author: String,
+    pub email: String,
     pub date: String,
     pub subject: String,
     pub body: String,
@@ -145,7 +146,7 @@ impl Repo {
         let mut args: Vec<String> = [
             "log",
             "--no-color",
-            "--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%b%x1f",
+            "--format=%x1e%H%x1f%P%x1f%aN%x1f%aE%x1f%aI%x1f%s%x1f%b%x1f",
         ]
         .iter()
         .chain(flags)
@@ -173,6 +174,7 @@ impl Repo {
                     .map(String::from)
                     .collect();
                 let author = f.next().unwrap_or("").to_string();
+                let email = f.next().unwrap_or("").to_string();
                 let date = f.next().unwrap_or("").to_string();
                 let subject = f.next().unwrap_or("").to_string();
                 let body = f.next().unwrap_or("").trim().to_string();
@@ -181,6 +183,7 @@ impl Repo {
                     id,
                     parents,
                     author,
+                    email,
                     date,
                     subject,
                     body,

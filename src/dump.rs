@@ -8,7 +8,12 @@
 //!   (merge or squash commit) that brought it in, `null` for a direct commit.
 //!
 //! A squash-merged PR yields both a `pr` record and a `commit` record for the same SHA.
+//!
+//! No commit text is stored: neither subjects nor messages. Each record keeps only what was
+//! derived from the message at dump time: the PR number, the merged branch name, and the AI
+//! models and tools credited.
 
+use crate::ai;
 use crate::git::{Commit, Repo};
 use crate::pr;
 use crate::repos::RepoArgs;
@@ -40,10 +45,16 @@ pub struct CommitRec {
     #[serde(default)]
     pub branch: Option<String>,
     pub author: String,
+    /// Author email (`.mailmap` applied); absent when authors are pseudonymized.
+    #[serde(default)]
+    pub author_email: Option<String>,
     pub date: String,
-    pub subject: String,
-    /// Full commit message (subject and body), so trailers can be re-parsed later.
-    pub message: String,
+    /// AI models (`Co-Authored-By:` trailers) and tools (`Generated with` lines) the commit
+    /// message credits.
+    #[serde(default)]
+    pub ai_models: Vec<String>,
+    #[serde(default)]
+    pub ai_tools: Vec<String>,
     pub added: u64,
     pub removed: u64,
 }
@@ -58,9 +69,14 @@ pub struct PrRec {
     #[serde(default)]
     pub branch: Option<String>,
     pub author: String,
+    #[serde(default)]
+    pub author_email: Option<String>,
     pub date: String,
-    pub subject: String,
-    pub message: String,
+    /// Credits in the merge commit's own message (for a squash, the commit's message).
+    #[serde(default)]
+    pub ai_models: Vec<String>,
+    #[serde(default)]
+    pub ai_tools: Vec<String>,
     /// The PR's net change against its first parent.
     pub added: u64,
     pub removed: u64,
@@ -69,12 +85,11 @@ pub struct PrRec {
     pub squash: bool,
 }
 
-fn message(c: &Commit) -> String {
-    if c.body.is_empty() {
-        c.subject.clone()
-    } else {
-        format!("{}\n\n{}", c.subject, c.body)
-    }
+/// Model and tool names credited by `c`'s message.
+fn credits(c: &Commit) -> (Vec<String>, Vec<String>) {
+    let u = ai::detect(&format!("{}\n\n{}", c.subject, c.body));
+    let names = |l: Vec<ai::Credit>| l.into_iter().map(|c| c.name).collect();
+    (names(u.models), names(u.tools))
 }
 
 fn commit_rec(
@@ -91,9 +106,10 @@ fn commit_rec(
         pr,
         branch: branch.map(String::from),
         author: c.author.clone(),
+        author_email: Some(c.email.clone()),
         date: c.date.clone(),
-        subject: c.subject.clone(),
-        message: message(c),
+        ai_models: credits(c).0,
+        ai_tools: credits(c).1,
         added: c.added,
         removed: c.removed,
     })
@@ -133,9 +149,10 @@ fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Res
             pr,
             branch: branch.clone(),
             author: c.author.clone(),
+            author_email: Some(c.email.clone()),
             date: c.date.clone(),
-            subject: c.subject.clone(),
-            message: message(c),
+            ai_models: credits(c).0,
+            ai_tools: credits(c).1,
             added,
             removed,
             commits,
@@ -159,6 +176,104 @@ fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Res
             .map(|m| commit_rec(name, m, Some(&c.id), pr, branch.as_deref())),
     );
     Ok(out)
+}
+
+/// Identity key: the lowercased email, or the lowercased name when there is none.
+fn identity(name: &str, email: &str) -> String {
+    if email.is_empty() { name } else { email }.to_lowercase()
+}
+
+const ADJECTIVES: &[&str] = &[
+    "amber", "azure", "bold", "brave", "bright", "calm", "clever", "coral", "cosmic", "crisp",
+    "dapper", "eager", "fancy", "fuzzy", "gentle", "golden", "happy", "humble", "icy", "ivory",
+    "jolly", "keen", "lively", "lucky", "maple", "mellow", "merry", "misty", "mossy", "nimble",
+    "noble", "olive", "peppy", "plucky", "polite", "proud", "quick", "quiet", "rapid", "rosy",
+    "rustic", "sandy", "shiny", "silent", "silver", "sleek", "snowy", "solar", "spry", "steady",
+    "sturdy", "sunny", "swift", "tawny", "teal", "tidy", "velvet", "vivid", "warm", "wild",
+    "windy", "witty", "young", "zesty",
+];
+
+const ANIMALS: &[&str] = &[
+    "badger", "beaver", "bison", "camel", "crane", "eagle", "falcon", "ferret", "finch", "fox",
+    "gecko", "hedgehog", "heron", "ibis", "jackal", "koala", "lark", "lemur", "lynx", "marmot",
+    "mole", "moose", "newt", "ocelot", "orca", "osprey", "otter", "owl", "panda", "parrot",
+    "pelican", "penguin", "pika", "plover", "puffin", "quail", "rabbit", "raven", "robin",
+    "salmon", "seal", "shrew", "skink", "snipe", "sparrow", "squid", "stoat", "stork", "swan",
+    "tapir", "tiger", "toucan", "trout", "turtle", "walrus", "weasel", "wombat", "wren", "yak",
+    "zebra", "bobcat", "cricket", "dolphin", "magpie",
+];
+
+/// `n` distinct pseudonyms like `amber-otter`, in an order shuffled by `seed`. Past the number
+/// of adjective-animal pairs, names repeat with a `-2`, `-3`, ... suffix.
+pub fn pseudonym_names(seed: u64, n: usize) -> Vec<String> {
+    let total = ADJECTIVES.len() * ANIMALS.len();
+    // Fisher-Yates over all pairs, driven by splitmix64 so it needs no dependency.
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut order: Vec<usize> = (0..total).collect();
+    for i in (1..total).rev() {
+        order.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    (0..n)
+        .map(|i| {
+            let p = order[i % total];
+            let name = format!(
+                "{}-{}",
+                ADJECTIVES[p / ANIMALS.len()],
+                ANIMALS[p % ANIMALS.len()]
+            );
+            match i / total {
+                0 => name,
+                round => format!("{name}-{}", round + 1),
+            }
+        })
+        .collect()
+}
+
+/// Replaces every author in `groups` (one group per repository dumped in this run) with a
+/// mnemonic pseudonym such as `amber-otter`, handed out in order of first appearance in time
+/// (ties by identity), and drops the email. All groups share one assignment, so a person is the
+/// same name in every file of the run. Nothing is stored: the names are shuffled by a per-run
+/// `seed`, so different runs give different names.
+pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
+    fn who(r: &mut Record) -> (&str, &mut String, &mut Option<String>) {
+        match r {
+            Record::Commit(c) => (&c.date, &mut c.author, &mut c.author_email),
+            Record::Pr(p) => (&p.date, &mut p.author, &mut p.author_email),
+        }
+    }
+    let mut first: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for r in groups.iter_mut().flatten() {
+        let (date, author, email) = who(r);
+        let (date, key) = (
+            date.to_string(),
+            identity(author, email.as_deref().unwrap_or("")),
+        );
+        let e = first.entry(key).or_insert_with(|| date.clone());
+        if date < *e {
+            *e = date;
+        }
+    }
+    let mut order: Vec<(String, String)> = first.into_iter().map(|(k, d)| (d, k)).collect();
+    order.sort();
+    let names = pseudonym_names(seed, order.len());
+    let label: std::collections::HashMap<String, String> = order
+        .into_iter()
+        .zip(names)
+        .map(|((_, k), name)| (k, name))
+        .collect();
+
+    for r in groups.iter_mut().flatten() {
+        let (_, author, email) = who(r);
+        *author = label[&identity(author, email.as_deref().unwrap_or(""))].clone();
+        *email = None;
+    }
 }
 
 pub fn write_lines(out: &mut impl Write, records: &[Record]) -> Result<()> {
@@ -238,4 +353,63 @@ pub fn read(paths: &[std::path::PathBuf]) -> Result<Vec<Record>> {
         load(&f.display().to_string(), &mut BufReader::new(file))?;
     }
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit(sha: &str, date: &str, name: &str, email: &str) -> Record {
+        Record::Commit(CommitRec {
+            repo: "r".into(),
+            sha: sha.into(),
+            pr_merge: None,
+            pr: None,
+            branch: None,
+            author: name.into(),
+            author_email: Some(email.into()),
+            date: date.into(),
+            ai_models: vec![],
+            ai_tools: vec![],
+            added: 0,
+            removed: 0,
+        })
+    }
+
+    #[test]
+    fn pseudonym_names_are_distinct_mnemonic_and_seeded() {
+        let n = ADJECTIVES.len() * ANIMALS.len();
+        let names = pseudonym_names(7, n + 3);
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            n + 3
+        );
+        assert!(names[0].chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+        assert!(names[n].ends_with("-2"));
+        assert_eq!(names, pseudonym_names(7, n + 3));
+        assert_ne!(pseudonym_names(7, 5), pseudonym_names(8, 5));
+        // no word can look like an AI vendor to the credit detector
+        assert!(names.iter().all(|x| !ai::is_ai_identity(x, "")));
+    }
+
+    #[test]
+    fn pseudonyms_are_shared_across_groups() {
+        let mut g = vec![
+            vec![commit("1", "2026-02-01", "Bob B", "bob@x.com")],
+            vec![
+                commit("2", "2026-01-01", "Ann Alias", "ann@x.com"),
+                commit("3", "2026-03-01", "Bob B", "BOB@x.com"),
+            ],
+        ];
+        pseudonymize(&mut g, 7);
+        let names = pseudonym_names(7, 2);
+        let c = |r: &Record| match r {
+            Record::Commit(c) => (c.author.clone(), c.author_email.clone()),
+            _ => unreachable!(),
+        };
+        // Ann's earliest commit is first; the same email in any case is the same person
+        assert_eq!(c(&g[1][0]), (names[0].clone(), None));
+        assert_eq!(c(&g[0][0]), (names[1].clone(), None));
+        assert_eq!(c(&g[1][1]).0, names[1]);
+    }
 }

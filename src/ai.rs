@@ -47,6 +47,11 @@ static CO_AUTHOR: LazyLock<Regex> =
 static GENERATED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?im)generated\s+(?:with|by|using)\s+\[?([^\]\(\n]+)").unwrap());
 
+/// Whether a `Co-Authored-By` style identity is an AI model or tool.
+pub fn is_ai_identity(name: &str, email: &str) -> bool {
+    VENDOR.is_match(name) || VENDOR.is_match(email)
+}
+
 /// AI attribution in a single commit message; each credit counts that one commit.
 pub fn detect(message: &str) -> Usage {
     let mut usage = Usage::default();
@@ -67,23 +72,25 @@ pub fn detect(message: &str) -> Usage {
     usage
 }
 
-/// Combines the commits of a PR, given as `(message, lines added, lines removed)`. Models and
-/// tools are ordered by how many commits credit them (ties keep the order first seen).
-pub fn combine<'a>(commits: impl IntoIterator<Item = (&'a str, u64, u64)>) -> Usage {
+/// One commit's credits as stored in a dump: model and tool names, and its own lines.
+pub type CommitCredits<'a> = (&'a [String], &'a [String], u64, u64);
+
+/// Combines the commits of a PR. Models and tools are ordered by how many commits credit them
+/// (ties keep the order first seen).
+pub fn combine<'a>(commits: impl IntoIterator<Item = CommitCredits<'a>>) -> Usage {
     let mut total = Usage::default();
-    for (message, added, removed) in commits {
-        let u = detect(message);
-        if u.is_empty() {
+    for (models, tools, added, removed) in commits {
+        if models.is_empty() && tools.is_empty() {
             continue;
         }
         total.ai_commits += 1;
         total.ai_added += added;
         total.ai_removed += removed;
-        for c in u.models {
-            credit(&mut total.models, &c.name, 1, added, removed, false);
+        for name in models {
+            credit(&mut total.models, name, 1, added, removed, false);
         }
-        for c in u.tools {
-            credit(&mut total.tools, &c.name, 1, added, removed, false);
+        for name in tools {
+            credit(&mut total.tools, name, 1, added, removed, false);
         }
     }
     total.models.sort_by(|a, b| b.commits.cmp(&a.commits));
@@ -154,24 +161,39 @@ mod tests {
         assert_eq!(u.models[0].commits, 1);
     }
 
+    fn credits(message: &str) -> (Vec<String>, Vec<String>) {
+        let u = detect(message);
+        (
+            u.models.into_iter().map(|c| c.name).collect(),
+            u.tools.into_iter().map(|c| c.name).collect(),
+        )
+    }
+
     #[test]
     fn combine_orders_by_commit_count_and_sums_lines() {
-        let opus = "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>";
-        let sonnet = "Co-Authored-By: claude sonnet 5 <noreply@anthropic.com>";
+        let opus = credits("Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>");
+        let sonnet = credits("Co-Authored-By: claude sonnet 5 <noreply@anthropic.com>");
+        let plain = credits("plain");
+        let c =
+            |x: &'static (Vec<String>, Vec<String>), a, r| (x.0.as_slice(), x.1.as_slice(), a, r);
+        let (opus, sonnet, plain) = (&opus, &sonnet, &plain);
         // tie (2 each) keeps first seen
+        let opus: &'static _ = Box::leak(Box::new(opus.clone()));
+        let sonnet: &'static _ = Box::leak(Box::new(sonnet.clone()));
+        let plain: &'static _ = Box::leak(Box::new(plain.clone()));
         let u = combine([
-            (opus, 1, 0),
-            (sonnet, 2, 0),
-            ("plain", 100, 100),
-            (sonnet, 4, 1),
-            (opus, 8, 0),
+            c(opus, 1, 0),
+            c(sonnet, 2, 0),
+            c(plain, 100, 100),
+            c(sonnet, 4, 1),
+            c(opus, 8, 0),
         ]);
         assert_eq!(names(&u.models), vec!["Claude Opus 5.5", "claude sonnet 5"]);
         let u = combine([
-            (sonnet, 2, 0),
-            (sonnet, 4, 1),
-            (opus, 8, 3),
-            ("plain", 5, 5),
+            c(sonnet, 2, 0),
+            c(sonnet, 4, 1),
+            c(opus, 8, 3),
+            c(plain, 5, 5),
         ]);
         assert_eq!(names(&u.models), vec!["claude sonnet 5", "Claude Opus 5.5"]);
         assert_eq!(

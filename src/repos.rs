@@ -152,25 +152,26 @@ impl RepoArgs {
         }
     }
 
-    /// Like `select`, but also returns the first-parent commits that aren't PRs (pushed straight
-    /// to the branch, or pulled in by a sync merge), flagged `false`. `-n` counts both together. With `--mode all` every
-    /// commit counts as a PR.
-    pub fn select_with_direct(
+    /// Every first-parent commit of `repo` in the window, newest first, as
+    /// `(commit, PR number, is a PR)`. Commits that aren't PRs were pushed straight to the
+    /// branch, or are `git pull` sync merges (merging the branch's own upstream back in).
+    fn classified(
         &self,
         repo: &git::Repo,
+        stats: bool,
     ) -> Result<Vec<(git::Commit, Option<u64>, bool)>> {
+        let rev = self.rev_for(repo);
         let commits = repo.first_parent_log(
-            &self.rev_for(repo),
+            &rev,
             self.since_date().as_deref(),
             self.until.as_deref(),
-            true,
+            stats,
         )?;
-        let trunk = repo.branch_name(&self.rev_for(repo));
+        let trunk = repo.branch_name(&rev);
         Ok(commits
             .into_iter()
             .map(|c| {
                 let n = pr::pr_number(&c);
-                // Merging the branch's own upstream back in (git pull) isn't a PR.
                 let sync = n.is_none()
                     && c.parents.len() > 1
                     && pr::merge_info(&c.subject)
@@ -183,27 +184,26 @@ impl RepoArgs {
                     };
                 (c, n, is_pr)
             })
-            .take(self.max_count.unwrap_or(usize::MAX))
             .collect())
+    }
+
+    /// All first-parent commits, PRs and not, with `-n` counting both together (for `dump`).
+    pub fn select_with_direct(
+        &self,
+        repo: &git::Repo,
+    ) -> Result<Vec<(git::Commit, Option<u64>, bool)>> {
+        let mut all = self.classified(repo, true)?;
+        all.truncate(self.max_count.unwrap_or(usize::MAX));
+        Ok(all)
     }
 
     /// The PR-like commits of `repo`, newest first, with their PR numbers.
     pub fn select(&self, repo: &git::Repo) -> Result<Selected> {
-        let rev = self.rev_for(repo);
-        let since = self.since_date();
-        let commits =
-            repo.first_parent_log(&rev, since.as_deref(), self.until.as_deref(), false)?;
-        Ok(commits
+        Ok(self
+            .classified(repo, false)?
             .into_iter()
-            .map(|c| {
-                let n = pr::pr_number(&c);
-                (c, n)
-            })
-            .filter(|(c, n)| match self.mode {
-                Mode::All => true,
-                Mode::Merges => c.parents.len() > 1,
-                Mode::Prs => c.parents.len() > 1 || n.is_some(),
-            })
+            .filter(|(_, _, is_pr)| *is_pr)
+            .map(|(c, n, _)| (c, n))
             .take(self.max_count.unwrap_or(usize::MAX))
             .collect())
     }

@@ -4,14 +4,23 @@ Walks back through merged PRs in a git repository and measures the
 **indentation-based complexity** each one added or removed. Supports C# and Python.
 
 ```
-retro-specter complexity [REV] -C <repo> [-n N] [--since DATE] [--files | --functions] [-f table|json|jsonl|csv]
+retro-specter complexity [REV] [-C <repo>]... [--scan <dir>]... [--months N | --days N] [--files | --functions] [-f table|json|jsonl|csv]
 ```
+
+`-j N` (before the subcommand) sets the worker threads. Build with `cargo build --release`
+(binary in `target/release/retro-specter`) or install with `cargo install --path .`.
+
+With several repositories (`-C` repeated, or `--scan DIR` to find checkouts recursively), the
+table gets a REPO column and hotspots are prefixed with `repo:`; the summary covers all of them.
+Linked git worktrees of a repository already in the set are skipped.
 
 ## How it works
 
 - Walks the first-parent history of `REV` (default `HEAD`). A commit counts as a PR if it is a
   merge commit, or if its message has a PR reference: GitHub `Merge pull request #N` / `(#N)`,
   Azure DevOps `Merged PR N`, or GitLab `See merge request !N`. `--mode merges|all` changes this.
+  `git pull` merges (`Merge branch 'master' of <url>`, or merging the branch's own upstream back
+  in) are not PRs; `dump` uses the same rule.
 - Diffs each PR against its first parent, which gives the PR's net change.
 - Scores each logical **statement** by its nesting level. Blank lines, comments, docstrings,
   `#` preprocessor lines and brace-only lines are ignored. The indent unit (2, 4, tabs…) is
@@ -65,20 +74,31 @@ retro-specter dump [REV] [-C <repo>]... [--scan <dir>]... [--fetch] [--months N 
 retro-specter ai [FILE|DIR]... [--by pr|commit] [--list] [-f table|json|jsonl|csv]
 ```
 
-**Dump format** (one file per repo, `<dir>/<repo>.jsonl`; a single repo without `-o` goes to stdout):
+**Dump format** (one file per repo, `<dir>/<repo>.jsonl`; a single repo without `-o` goes to stdout).
+No commit text is stored: no subjects, no messages. Records keep only what was derived from a
+message at dump time (PR number, merged branch name, AI credits), so changing the AI vendor list
+means re-dumping.
 
-- `{"type":"pr", repo, sha, pr, branch, author, date, subject, message, added, removed, commits, squash}`
+- `{"type":"pr", repo, sha, pr, branch, author, author_email, date, ai_models, ai_tools, added, removed, commits, squash}`
   a merged PR (merge commit, or squash/numbered commit). `added`/`removed` are its net change
-  against the target branch.
-- `{"type":"commit", repo, sha, pr_merge, pr, branch, author, date, subject, message, added, removed}`
+  against the target branch. `ai_*` are the credits in the merge commit's own message.
+- `{"type":"commit", repo, sha, pr_merge, pr, branch, author, author_email, date, ai_models, ai_tools, added, removed}`
   a non-merge commit. `pr_merge` is the `sha` of the PR record that brought it in (`null` for
   a direct commit), so commits group into PRs by `(repo, pr_merge)`. A squash-merged PR has
-  both records for the same sha; rebase-merged commits look like direct commits.
+  both records for the same sha; rebase-merged commits look like direct commits. `ai_models`
+  come from `Co-Authored-By:` trailers and `ai_tools` from `Generated with …` lines.
 - `branch` is the merged branch's name taken from the merge subject. For merges without a PR
   number (`pr: null`) it is the pseudo-PR label (`Merge branch 'x'`, `Merge x into main`, ...).
+  It is the one piece of free-form text left in a dump, and a branch name can contain a name.
 - A `git pull` merge (`Merge branch 'master' of <url>`, or merging the trunk into itself) is not
   a PR: it emits no `pr` record, and the commits it brought in are dumped as direct commits.
-- `message` is the full commit message, so the AI vendor list can change without re-dumping.
+- **Authors** (`--authors pseudonym|real`, default `pseudonym`): authors are mnemonic pseudonyms
+  like `amber-otter` and `author_email` is dropped. Names are handed out in order of first
+  appearance and shared by all repositories dumped in the same run, so a person is the same name
+  in every file of that run. Nothing is stored between runs: the names are shuffled by a per-run
+  seed, so a later dump gives different names (a coincidental repeat for a different person is
+  possible but rare, so don't mix dumps from different runs when counting people).
+  `--authors real` keeps names and emails (with the repo's `.mailmap` applied).
 
 **ai**: models come from `Co-Authored-By:` trailers (Claude, Copilot, Gemini, GPT, Cursor, Aider, …),
 tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (default: stdin).
@@ -91,7 +111,7 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
   other commits are the net lines scaled by the AI commits' share of commit churn (an estimate;
   exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
 
-`--months N` / `--days N` (dump time) limit the window; `--scan DIR` finds git checkouts
+`--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `--scan DIR` finds git checkouts
 recursively; `--fetch` runs `git fetch` first and dumps the branch's upstream. Linked worktrees of
 a repository already in the set are skipped (the main checkout is kept). `complexity` accepts the
-same repo options.
+same repo options. `--mode` applies to `dump` too, and `-n` there counts PRs and direct commits together.

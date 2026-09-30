@@ -40,6 +40,21 @@ struct DumpArgs {
     /// Without it, a single repository is written to stdout; several need this.
     #[arg(short, long, value_name = "DIR")]
     out_dir: Option<PathBuf>,
+
+    /// How authors appear in the dump.
+    #[arg(long, value_enum, default_value_t = Authors::Pseudonym)]
+    authors: Authors,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum Authors {
+    /// Mnemonic names like `amber-otter`, assigned per run across all repositories dumped
+    /// together (nothing is stored, so different runs give different names). Emails are
+    /// dropped, non-AI `Signed-off-by:` style trailers are rewritten to match, and the owner
+    /// is removed from `Merge pull request #N from owner/...` subjects.
+    Pseudonym,
+    /// Real names, plus emails (with `.mailmap` applied).
+    Real,
 }
 
 #[derive(Args)]
@@ -152,35 +167,58 @@ fn run() -> Result<()> {
 
 fn dump_cmd(cli: &DumpArgs) -> Result<()> {
     let repos = cli.repos.open_repos()?;
-    let Some(dir) = &cli.out_dir else {
+    if cli.out_dir.is_none() {
         anyhow::ensure!(
             repos.len() == 1,
             "{} repositories found; pass --out-dir to write one file per repository",
             repos.len()
         );
-        let records = dump::dump_repo(&repos[0], &cli.repos)?;
-        let mut out = BufWriter::new(io::stdout().lock());
-        dump::write_lines(&mut out, &records)?;
-        return Ok(out.flush()?);
-    };
+    }
     let mut used = std::collections::HashSet::new();
+    let mut dumped = Vec::new(); // (repo name, file name, records)
     for repo in &repos {
         let file = dump::file_name(repo, &mut used);
-        // A failing repository leaves its previous dump untouched.
-        match dump::dump_repo(repo, &cli.repos).and_then(|r| {
-            dump::write_file(dir, &file, &r)?;
-            Ok(r.len())
-        }) {
-            Ok(n) => eprintln!(
-                "{}: {n} records -> {}",
-                repo.name(),
-                dir.join(&file).display()
-            ),
+        match dump::dump_repo(repo, &cli.repos) {
+            Ok(r) => dumped.push((repo.name(), file, r)),
+            // A failing repository leaves its previous dump untouched.
             Err(e) if repos.len() > 1 => eprintln!("skipping {}: {e:#}", repo.name()),
             Err(e) => return Err(e),
         }
     }
+
+    let mut groups: Vec<Vec<dump::Record>> = dumped
+        .iter_mut()
+        .map(|d| std::mem::take(&mut d.2))
+        .collect();
+    if cli.authors == Authors::Pseudonym {
+        dump::pseudonymize(&mut groups, run_seed());
+    }
+    match &cli.out_dir {
+        None => {
+            let mut out = BufWriter::new(io::stdout().lock());
+            dump::write_lines(&mut out, &groups[0])?;
+            out.flush()?;
+        }
+        Some(dir) => {
+            for ((name, file, _), records) in dumped.iter().zip(&groups) {
+                dump::write_file(dir, file, records)?;
+                eprintln!(
+                    "{name}: {} records -> {}",
+                    records.len(),
+                    dir.join(file).display()
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// A seed that differs from run to run, so pseudonyms from separate dumps differ.
+fn run_seed() -> u64 {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    d.as_nanos() as u64 ^ (u64::from(std::process::id()) << 32)
 }
 
 fn ai(cli: &AiArgs) -> Result<()> {
