@@ -12,10 +12,20 @@ pub enum Detail {
     Function,
 }
 
+fn multi_repo(prs: &[PrResult]) -> bool {
+    prs.iter().any(|p| p.repo != prs[0].repo)
+}
+
 pub fn table(out: &mut impl Write, prs: &[PrResult], detail: Detail, top: usize) -> io::Result<()> {
+    let multi = !prs.is_empty() && multi_repo(prs);
     writeln!(
         out,
-        "{:<10}  {:>6}  {:<9}  {:>5}  {:>6}  {:>7}  {:>7}  {:>7}  {:>4}  {:>11}  {:>5}  SUBJECT",
+        "{}{:<10}  {:>6}  {:<9}  {:>5}  {:>6}  {:>7}  {:>7}  {:>7}  {:>4}  {:>11}  {:>5}  SUBJECT",
+        if multi {
+            format!("{:<20}  ", "REPO")
+        } else {
+            String::new()
+        },
         "DATE",
         "PR",
         "COMMIT",
@@ -31,7 +41,12 @@ pub fn table(out: &mut impl Write, prs: &[PrResult], detail: Detail, top: usize)
     for pr in prs {
         writeln!(
             out,
-            "{:<10}  {:>6}  {:<9}  {:>5}  {:>6}  {:>7}  {:>7}  {:>+7}  {:>4}  {:>11}  {:>+5}  {}",
+            "{}{:<10}  {:>6}  {:<9}  {:>5}  {:>6}  {:>7}  {:>7}  {:>+7}  {:>4}  {:>11}  {:>+5}  {}",
+            if multi {
+                format!("{:<20}  ", truncate(&pr.repo, 20))
+            } else {
+                String::new()
+            },
             pr.date.get(..10).unwrap_or(&pr.date),
             pr.pr.map(|n| format!("#{n}")).unwrap_or_default(),
             short(&pr.commit),
@@ -51,7 +66,8 @@ pub fn table(out: &mut impl Write, prs: &[PrResult], detail: Detail, top: usize)
         for f in &pr.files {
             writeln!(
                 out,
-                "{:>36}  {:>6}  {:>7}  {:>7}  {:>+7}  {:>4}  {:>11}  {:>+5}  {} {}",
+                "{}{:>36}  {:>6}  {:>7}  {:>7}  {:>+7}  {:>4}  {:>11}  {:>+5}  {} {}",
+                if multi { " ".repeat(22) } else { String::new() },
                 "",
                 f.added.lines,
                 f.added.total,
@@ -75,7 +91,8 @@ pub fn table(out: &mut impl Write, prs: &[PrResult], detail: Detail, top: usize)
                     };
                     writeln!(
                         out,
-                        "{:>40}{sym} {} {label}: {}",
+                        "{}{:>40}{sym} {} {label}: {}",
+                        if multi { " ".repeat(22) } else { String::new() },
                         "",
                         classes.len(),
                         truncate(&classes.join(", "), 100)
@@ -89,7 +106,13 @@ pub fn table(out: &mut impl Write, prs: &[PrResult], detail: Detail, top: usize)
                     (Some(b), None) => ("-", fmt_fn(&b)),
                     (None, None) => continue,
                 };
-                writeln!(out, "{:>40}{sym} {}  {cplx}", "", fc.name)?;
+                writeln!(
+                    out,
+                    "{}{:>40}{sym} {}  {cplx}",
+                    if multi { " ".repeat(22) } else { String::new() },
+                    "",
+                    fc.name
+                )?;
             }
         }
     }
@@ -162,19 +185,27 @@ fn summary(out: &mut impl Write, prs: &[PrResult], top: usize) -> io::Result<()>
         growth: i64,
         current: Option<Option<Stats>>,
     }
-    let mut files: HashMap<&str, Hot> = HashMap::new();
-    let mut funcs: HashMap<(&str, &str), HotFn> = HashMap::new();
+    let mut files: HashMap<(&str, &str), Hot> = HashMap::new();
+    let mut funcs: HashMap<(&str, &str, &str), HotFn> = HashMap::new();
+    let multi = multi_repo(prs);
+    let place = |repo: &str, path: &str| {
+        if multi {
+            format!("{repo}: {path}")
+        } else {
+            path.to_string()
+        }
+    };
     for p in prs {
         // `prs` is newest first, so the first value seen is the most recent.
         for f in &p.files {
-            let h = files.entry(f.path.as_str()).or_default();
+            let h = files.entry((p.repo.as_str(), f.path.as_str())).or_default();
             h.prs += 1;
             h.added += f.added.total;
             h.delta += f.delta;
             h.current.get_or_insert(f.after.total);
             h.functions.get_or_insert(f.counts_after.functions);
             for fc in &f.functions {
-                let h = funcs.entry((&f.path, &fc.name)).or_default();
+                let h = funcs.entry((&p.repo, &f.path, &fc.name)).or_default();
                 h.prs += 1;
                 h.growth += fc.after.map_or(0, |s| s.total as i64)
                     - fc.before.map_or(0, |s| s.total as i64);
@@ -191,7 +222,7 @@ fn summary(out: &mut impl Write, prs: &[PrResult], top: usize) -> io::Result<()>
         "  {:>7}  {:>7}  {:>7}  {:>5}  {:>4}  PATH",
         "+CPLX", "ΔCPLX", "NOW", "FUNCS", "PRS"
     )?;
-    for (path, h) in hot.iter().take(top) {
+    for ((repo, path), h) in hot.iter().take(top) {
         writeln!(
             out,
             "  {:>7}  {:>+7}  {:>7}  {:>5}  {:>4}  {path}",
@@ -199,7 +230,8 @@ fn summary(out: &mut impl Write, prs: &[PrResult], top: usize) -> io::Result<()>
             h.delta,
             h.current.unwrap_or(0),
             h.functions.unwrap_or(0),
-            h.prs
+            h.prs,
+            path = place(repo, path)
         )?;
     }
 
@@ -212,7 +244,7 @@ fn summary(out: &mut impl Write, prs: &[PrResult], top: usize) -> io::Result<()>
             "  {:>7}  {:>7}  {:>5}  {:>4}  FUNCTION",
             "ΔCPLX", "NOW", "DEPTH", "PRS"
         )?;
-        for ((path, name), h) in hot_fns.iter().take(top) {
+        for ((repo, path, name), h) in hot_fns.iter().take(top) {
             let now = h.current.flatten();
             writeln!(
                 out,
@@ -220,7 +252,8 @@ fn summary(out: &mut impl Write, prs: &[PrResult], top: usize) -> io::Result<()>
                 h.growth,
                 now.map_or("gone".into(), |s| s.total.to_string()),
                 now.map_or(String::new(), |s| s.max.to_string()),
-                h.prs
+                h.prs,
+                path = place(repo, path)
             )?;
         }
     }
@@ -231,7 +264,8 @@ pub fn csv(out: &mut impl Write, prs: &[PrResult], detail: Detail) -> io::Result
     const COUNTS: &str = "functions_before,functions_after,classes_before,classes_after,functions_added,functions_removed,functions_modified,classes_added,classes_removed";
     let pr_cols = |p: &PrResult| {
         format!(
-            "{},{},{}",
+            "{},{},{},{}",
+            esc(&p.repo),
             p.date,
             p.pr.map(|n| n.to_string()).unwrap_or_default(),
             p.commit
@@ -261,7 +295,7 @@ pub fn csv(out: &mut impl Write, prs: &[PrResult], detail: Detail) -> io::Result
         Detail::Function => {
             writeln!(
                 out,
-                "date,pr,commit,path,language,function,change,lines_before,cplx_before,depth_before,lines_after,cplx_after,depth_after"
+                "repo,date,pr,commit,path,language,function,change,lines_before,cplx_before,depth_before,lines_after,cplx_after,depth_after"
             )?;
             for p in prs {
                 for f in &p.files {
@@ -284,7 +318,7 @@ pub fn csv(out: &mut impl Write, prs: &[PrResult], detail: Detail) -> io::Result
         Detail::File => {
             writeln!(
                 out,
-                "date,pr,commit,path,status,language,lines_added,cplx_added,cplx_removed,max_depth_added,cplx_before,cplx_after,delta,{COUNTS}"
+                "repo,date,pr,commit,path,status,language,lines_added,cplx_added,cplx_removed,max_depth_added,cplx_before,cplx_after,delta,{COUNTS}"
             )?;
             for p in prs {
                 for f in &p.files {
@@ -310,7 +344,7 @@ pub fn csv(out: &mut impl Write, prs: &[PrResult], detail: Detail) -> io::Result
         Detail::Pr => {
             writeln!(
                 out,
-                "date,pr,commit,author,files,lines_added,cplx_added,cplx_removed,max_depth_added,cplx_before,cplx_after,delta,{COUNTS},subject"
+                "repo,date,pr,commit,author,files,lines_added,cplx_added,cplx_removed,max_depth_added,cplx_before,cplx_after,delta,{COUNTS},subject"
             )?;
             for p in prs {
                 writeln!(

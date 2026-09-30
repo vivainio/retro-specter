@@ -1,45 +1,54 @@
-mod analyze;
-mod complexity;
-mod git;
-mod pr;
-mod report;
-mod structure;
-
 use anyhow::Result;
-use clap::{Parser, ValueEnum};
-use complexity::Language;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
+use retro_specter::complexity::Language;
+use retro_specter::repos::RepoArgs;
+use retro_specter::{analyze, git, report, usage};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
 
-/// Walk back through merged PRs in git history and measure the
-/// indentation-based complexity each one added or removed (C#, Python).
+/// Retrospective analysis of merged PRs in git history.
 #[derive(Parser)]
-#[command(version)]
+#[command(version, arg_required_else_help = true)]
 struct Cli {
-    /// Revision to start walking back from.
-    #[arg(default_value = "HEAD")]
-    rev: String,
+    /// Worker threads (default: number of CPUs).
+    #[arg(short, long, global = true)]
+    jobs: Option<usize>,
 
-    /// Path to the git repository.
-    #[arg(short = 'C', long, default_value = ".")]
-    repo: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// Maximum number of PRs to analyze (newest first).
-    #[arg(short = 'n', long)]
-    max_count: Option<usize>,
+#[derive(Subcommand)]
+enum Command {
+    /// Measure the indentation-based complexity each PR added or removed (C#, Python).
+    Complexity(ComplexityArgs),
+    /// Aggregate AI usage from commit messages (Co-Authored-By trailers, "Generated with"
+    /// lines) and lines added/removed per PR. Reads messages and numstat only: any language.
+    Ai(AiArgs),
+}
 
-    /// Only PRs merged after this date (anything `git log --since` accepts).
+#[derive(Args)]
+struct AiArgs {
+    #[command(flatten)]
+    repos: RepoArgs,
+
+    #[arg(short, long, value_enum, default_value_t = Format::Table)]
+    format: Format,
+
+    /// Aggregate per merged PR (models of all its commits combined, most commits first)
+    /// or per individual commit.
+    #[arg(long, value_enum, default_value_t = usage::Unit::Pr)]
+    by: usage::Unit,
+
+    /// List every row (table format) instead of only the summary.
     #[arg(long)]
-    since: Option<String>,
+    list: bool,
+}
 
-    /// Only PRs merged before this date.
-    #[arg(long)]
-    until: Option<String>,
-
-    /// Which first-parent commits count as PRs.
-    #[arg(long, value_enum, default_value_t = Mode::Prs)]
-    mode: Mode,
+#[derive(Args)]
+struct ComplexityArgs {
+    #[command(flatten)]
+    repos: RepoArgs,
 
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
     format: Format,
@@ -80,20 +89,6 @@ struct Cli {
     /// Number of entries in the summary top lists (table format; 0 = no summary).
     #[arg(long, default_value_t = 10)]
     top: usize,
-
-    /// Worker threads (default: number of CPUs).
-    #[arg(short, long)]
-    jobs: Option<usize>,
-}
-
-#[derive(Clone, Copy, ValueEnum, PartialEq)]
-enum Mode {
-    /// Merge commits, plus commits whose message references a PR (squash merges).
-    Prs,
-    /// Only merge commits.
-    Merges,
-    /// Every commit on the first-parent chain.
-    All,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -133,57 +128,60 @@ fn run() -> Result<()> {
             .num_threads(j)
             .build_global()?;
     }
+    match cli.command {
+        Command::Complexity(args) => complexity(&args),
+        Command::Ai(args) => ai(&args),
+    }
+}
 
-    let repo = git::Repo::open(&cli.repo)?;
+fn ai(cli: &AiArgs) -> Result<()> {
+    let repos = cli.repos.open_repos()?;
+    let mut all = Vec::new();
+    for repo in &repos {
+        let r = match cli.by {
+            usage::Unit::Pr => cli
+                .repos
+                .select_with_direct(repo)
+                .and_then(|sel| usage::by_pr(repo, &sel)),
+            usage::Unit::Commit => usage::by_commit(repo, &cli.repos),
+        };
+        match r {
+            Ok(r) => all.extend(r),
+            Err(e) if repos.len() > 1 => eprintln!("skipping {}: {e:#}", repo.name()),
+            Err(e) => return Err(e),
+        }
+    }
 
-    let mut pathspecs: Vec<String> = Language::EXTENSIONS
-        .iter()
-        .map(|(ext, _)| format!("*.{ext}"))
-        .collect();
-    let excludes = cli.excludes.iter().map(String::as_str).chain(
-        DEFAULT_EXCLUDES
-            .iter()
-            .copied()
-            .filter(|_| !cli.no_default_excludes),
-    );
-    pathspecs.extend(excludes.map(|g| format!(":(exclude){g}")));
+    let mut out = BufWriter::new(io::stdout().lock());
+    match cli.format {
+        Format::Table => usage::table(&mut out, &all, cli.by, cli.list)?,
+        Format::Csv => usage::csv(&mut out, &all)?,
+        Format::Json => {
+            serde_json::to_writer_pretty(&mut out, &all)?;
+            writeln!(out)?;
+        }
+        Format::Jsonl => {
+            for r in &all {
+                serde_json::to_writer(&mut out, r)?;
+                writeln!(out)?;
+            }
+        }
+    }
+    out.flush()?;
+    Ok(())
+}
 
-    let opts = analyze::Options {
-        tab_width: cli.tab_width.max(1),
-        max_file_bytes: cli.max_file_bytes,
-        paths: cli.paths.clone(),
-        pathspecs,
-        empty_tree: repo.empty_tree()?,
-    };
+fn complexity(cli: &ComplexityArgs) -> Result<()> {
+    let repos = cli.repos.open_repos()?;
 
-    let commits = repo.first_parent_log(&cli.rev, cli.since.as_deref(), cli.until.as_deref())?;
-    let selected: Vec<(git::Commit, Option<u64>)> = commits
-        .into_iter()
-        .map(|c| {
-            let n = pr::pr_number(&c);
-            (c, n)
-        })
-        .filter(|(c, n)| match cli.mode {
-            Mode::All => true,
-            Mode::Merges => c.parents.len() > 1,
-            Mode::Prs => c.parents.len() > 1 || n.is_some(),
-        })
-        .take(cli.max_count.unwrap_or(usize::MAX))
-        .collect();
-
-    let results: Vec<analyze::PrResult> = selected
-        .par_iter()
-        .map_init(
-            || repo.cat_file(),
-            |cat, (commit, n)| {
-                let cat = cat.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                analyze::analyze_commit(&repo, cat, commit, *n, &opts)
-            },
-        )
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|r| cli.include_empty || !r.files.is_empty())
-        .collect();
+    let mut results = Vec::new();
+    for repo in &repos {
+        match analyze_repo(cli, repo) {
+            Ok(r) => results.extend(r),
+            Err(e) if repos.len() > 1 => eprintln!("skipping {}: {e:#}", repo.name()),
+            Err(e) => return Err(e),
+        }
+    }
 
     let detail = if cli.functions {
         report::Detail::Function
@@ -209,4 +207,42 @@ fn run() -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+fn analyze_repo(cli: &ComplexityArgs, repo: &git::Repo) -> Result<Vec<analyze::PrResult>> {
+    let mut pathspecs: Vec<String> = Language::EXTENSIONS
+        .iter()
+        .map(|(ext, _)| format!("*.{ext}"))
+        .collect();
+    let excludes = cli.excludes.iter().map(String::as_str).chain(
+        DEFAULT_EXCLUDES
+            .iter()
+            .copied()
+            .filter(|_| !cli.no_default_excludes),
+    );
+    pathspecs.extend(excludes.map(|g| format!(":(exclude){g}")));
+
+    let opts = analyze::Options {
+        tab_width: cli.tab_width.max(1),
+        max_file_bytes: cli.max_file_bytes,
+        paths: cli.paths.clone(),
+        pathspecs,
+        empty_tree: repo.empty_tree()?,
+    };
+
+    let selected = cli.repos.select(repo)?;
+
+    Ok(selected
+        .par_iter()
+        .map_init(
+            || repo.cat_file(),
+            |cat, (commit, n)| {
+                let cat = cat.as_mut().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                analyze::analyze_commit(repo, cat, commit, *n, &opts)
+            },
+        )
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|r| cli.include_empty || !r.files.is_empty())
+        .collect())
 }

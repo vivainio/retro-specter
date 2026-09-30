@@ -4,7 +4,7 @@ Walks back through merged PRs in a git repository and measures the
 **indentation-based complexity** each one added or removed. Supports C# and Python.
 
 ```
-retro-specter [REV] -C <repo> [-n N] [--since DATE] [--files | --functions] [-f table|json|jsonl|csv]
+retro-specter complexity [REV] -C <repo> [-n N] [--since DATE] [--files | --functions] [-f table|json|jsonl|csv]
 ```
 
 ## How it works
@@ -53,3 +53,25 @@ functions whose complexity grew the most.
 
 Generated files (`*.Designer.cs`, `*.g.cs`, `*_pb2.py`, …) are excluded by default. Use
 `--exclude GLOB` to add more, or `--no-default-excludes` to turn this off.
+
+## ai subcommand
+
+Aggregates AI usage from commit messages. It reads messages and `git diff --numstat` only: no
+complexity analysis, any language, PRs with no code included.
+
+```
+retro-specter ai [REV] [-C <repo>]... [--scan <dir>]... [--fetch] [--by pr|commit] [--list] [-f table|json|jsonl|csv]
+```
+
+- Models come from `Co-Authored-By:` trailers (Claude, Copilot, Gemini, GPT, Cursor, Aider, …);
+  tools from `Generated with …` lines.
+- `--by pr` (default): one row per merged PR. It combines the trailers of every commit in the PR
+  and lists the models in one field, most commits first (`Claude Sonnet 5 (3), Claude Opus 5.5 (2)`).
+  Commits on the branch that aren't in any PR are reported separately as **direct commits**.
+  `--by commit`: one row per non-merge commit.
+- Reports rows, commits, lines added/removed per model / tool, with vs. without AI credit, per repo.
+- `--months N` / `--days N` limit the window (shorthand for `--since "N months ago"`); both
+  subcommands accept them.
+- `--scan DIR` finds git checkouts recursively (`--scan-depth`, default 6); `--fetch` runs
+  `git fetch` first and analyzes the branch's upstream. Both subcommands accept them.
+  Linked worktrees of a repository already in the set are skipped (the main checkout is kept).

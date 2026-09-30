@@ -84,6 +84,7 @@ pub struct FileResult {
 
 #[derive(Serialize)]
 pub struct PrResult {
+    pub repo: String,
     pub commit: String,
     pub pr: Option<u64>,
     pub author: String,
@@ -114,6 +115,7 @@ pub fn analyze_commit(
     let diffs = repo.diff(base, &commit.id, &opts.pathspecs)?;
 
     let mut result = PrResult {
+        repo: repo.name(),
         commit: commit.id.clone(),
         pr,
         author: commit.author.clone(),

@@ -39,6 +39,129 @@ impl Repo {
         Ok(repo)
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// `(common git dir, is a linked worktree)`. All worktrees of one repository share the
+    /// common dir, so it identifies the repository itself.
+    pub fn identity(&self) -> Option<(PathBuf, bool)> {
+        let out = self
+            .run(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ])
+            .ok()?;
+        let mut lines = out.lines();
+        let git_dir = PathBuf::from(lines.next()?).canonicalize().ok()?;
+        let common = PathBuf::from(lines.next()?).canonicalize().ok()?;
+        let linked = git_dir != common;
+        Some((common, linked))
+    }
+
+    /// Short name of the repository, taken from its directory.
+    pub fn name(&self) -> String {
+        self.dir
+            .canonicalize()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| self.dir.display().to_string())
+    }
+
+    /// Total `(added, removed)` lines between two revisions, over all files
+    /// (binary files are skipped).
+    pub fn numstat(&self, from: &str, to: &str) -> Result<(u64, u64)> {
+        let out = self.run(&[
+            "diff",
+            "--numstat",
+            "--no-color",
+            "--no-ext-diff",
+            from,
+            to,
+            "--",
+        ])?;
+        Ok(sum_numstat(&out))
+    }
+
+    /// `git fetch` from the default remote, so history is current before analysis.
+    pub fn fetch(&self) -> Result<()> {
+        self.run(&["fetch", "--quiet", "--tags"]).map(|_| ())
+    }
+
+    /// The upstream of the current branch (e.g. `origin/main`), if it has one.
+    pub fn upstream(&self) -> Option<String> {
+        self.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Messages of the non-merge commits in `base..tip`, i.e. the commits a merged PR brought in.
+    pub fn branch_messages(&self, base: &str, tip: &str) -> Result<Vec<String>> {
+        let out = self.run(&[
+            "log",
+            "--no-color",
+            "--no-merges",
+            "--format=%B%x1e",
+            &format!("{base}..{tip}"),
+            "--",
+        ])?;
+        Ok(out
+            .split('\x1e')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from)
+            .collect())
+    }
+
+    /// Every non-merge commit reachable from `rev`, newest first, with lines added / removed.
+    pub fn commit_log(
+        &self,
+        rev: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        max_count: Option<usize>,
+    ) -> Result<Vec<(Commit, u64, u64)>> {
+        let mut args = vec![
+            "log".to_string(),
+            "--no-merges".into(),
+            "--numstat".into(),
+            "--no-color".into(),
+            "--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%b%x1f".into(),
+        ];
+        args.extend(since.map(|s| format!("--since={s}")));
+        args.extend(until.map(|u| format!("--until={u}")));
+        args.extend(max_count.map(|n| format!("--max-count={n}")));
+        args.push(rev.to_string());
+        args.push("--".into());
+
+        let out = self.run(&args)?;
+        Ok(out
+            .split('\x1e')
+            .filter_map(|rec| {
+                let mut f = rec.trim_start_matches('\n').split('\x1f');
+                let id = f.next().filter(|s| !s.is_empty())?.to_string();
+                let commit = Commit {
+                    id,
+                    parents: f
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .map(String::from)
+                        .collect(),
+                    author: f.next().unwrap_or("").to_string(),
+                    date: f.next().unwrap_or("").to_string(),
+                    subject: f.next().unwrap_or("").to_string(),
+                    body: f.next().unwrap_or("").trim().to_string(),
+                };
+                let (added, removed) = sum_numstat(f.next().unwrap_or(""));
+                Some((commit, added, removed))
+            })
+            .collect())
+    }
+
     fn cmd(&self) -> Command {
         let mut c = Command::new("git");
         c.arg("-C")
@@ -164,6 +287,20 @@ impl Repo {
             stdout,
         })
     }
+}
+
+/// Sums the added / removed columns of `--numstat` output (binary files show `-` and are skipped).
+fn sum_numstat(out: &str) -> (u64, u64) {
+    out.lines().fold((0, 0), |(a, r), l| {
+        let mut f = l.split('\t');
+        match (
+            f.next().and_then(|x| x.parse::<u64>().ok()),
+            f.next().and_then(|x| x.parse::<u64>().ok()),
+        ) {
+            (Some(x), Some(y)) => (a + x, r + y),
+            _ => (a, r),
+        }
+    })
 }
 
 fn parse_diff(out: &str) -> Vec<FileDiff> {
