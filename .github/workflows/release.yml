@@ -1,5 +1,5 @@
-# Builds release binaries and attaches them to a GitHub release
-# (Linux, macOS arm64 and Intel, Windows).
+# Builds release binaries (Linux, macOS arm64 and Intel, Windows) and attaches them,
+# unpacked, to a GitHub release.
 # Nothing runs on push or pull request; create a release to trigger it:
 #   gh release create v0.1.0 --generate-notes
 name: release
@@ -49,23 +49,13 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
-        id: package
-        shell: bash
-        run: |
-          name="retro-specter-${{ github.event.release.tag_name }}-${{ matrix.target }}"
-          mkdir "$name"
-          cp "target/${{ matrix.target }}/release/retro-specter${{ matrix.exe }}" README.md "$name/"
-          if [ "${{ matrix.exe }}" = ".exe" ]; then
-            7z a "$name.zip" "$name"
-            echo "file=$name.zip" >> "$GITHUB_OUTPUT"
-          else
-            tar czf "$name.tar.gz" "$name"
-            echo "file=$name.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
-
+      # Published as-is, one asset per target, named so that a stable URL like
+      # releases/latest/download/retro-specter-aarch64-apple-darwin always works.
       - name: Upload to release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "${{ steps.package.outputs.file }}" --clobber
+        run: |
+          asset="retro-specter-${{ matrix.target }}${{ matrix.exe }}"
+          cp "target/${{ matrix.target }}/release/retro-specter${{ matrix.exe }}" "$asset"
+          gh release upload "${{ github.event.release.tag_name }}" "$asset" --clobber
