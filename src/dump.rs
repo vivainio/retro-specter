@@ -57,6 +57,10 @@ pub struct CommitRec {
     pub ai_tools: Vec<String>,
     pub added: u64,
     pub removed: u64,
+    /// Present (as `true`) only on a remote branch that is not merged into the walked
+    /// revision; `branch` names it. Merged and direct commits omit the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmerged: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,10 +116,12 @@ fn commit_rec(
         ai_tools: credits(c).1,
         added: c.added,
         removed: c.removed,
+        unmerged: false,
     })
 }
 
-/// All records for `repo`, newest first; each PR is followed by its commits.
+/// All records for `repo`, newest first; each PR is followed by its commits. With
+/// `--unmerged`, commits of unmerged remote branches follow.
 pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
     let name = repo.name();
     let items = args.select_with_direct(repo)?;
@@ -123,7 +129,49 @@ pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
         .par_iter()
         .map(|(c, pr, is_pr)| one(repo, &name, c, *pr, *is_pr))
         .collect::<Result<Vec<_>>>()?;
-    Ok(groups.into_iter().flatten().collect())
+    let mut records: Vec<Record> = groups.into_iter().flatten().collect();
+    if args.unmerged {
+        records.extend(unmerged_commits(repo, &name, args)?);
+    }
+    Ok(records)
+}
+
+/// Commits on remote branches that the walked revision doesn't contain. A commit reachable
+/// from several branches is reported once, for the first branch (by name) that has it.
+fn unmerged_commits(repo: &Repo, name: &str, args: &RepoArgs) -> Result<Vec<Record>> {
+    let Some(since) = args.since_date() else {
+        anyhow::bail!("--unmerged needs a time window: pass --since, --months or --days");
+    };
+    let target = args.rev_for(repo);
+    let live = if args.fetch {
+        repo.live_remote_branches().ok()
+    } else {
+        None
+    };
+    let mut branches = repo.remote_branches()?;
+    branches.sort();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for b in branches {
+        let short = b.strip_prefix("origin/").unwrap_or(&b);
+        if b == target || live.as_ref().is_some_and(|l| !l.contains(short)) {
+            continue;
+        }
+        let log = repo.commit_log(
+            &format!("{target}..{b}"),
+            Some(&since),
+            args.until.as_deref(),
+            None,
+        )?;
+        for c in log.iter().filter(|c| seen.insert(c.id.clone())) {
+            let Record::Commit(mut rec) = commit_rec(name, c, None, None, Some(short)) else {
+                unreachable!()
+            };
+            rec.unmerged = true;
+            out.push(Record::Commit(rec));
+        }
+    }
+    Ok(out)
 }
 
 fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Result<Vec<Record>> {
@@ -373,6 +421,7 @@ mod tests {
             ai_tools: vec![],
             added: 0,
             removed: 0,
+            unmerged: false,
         })
     }
 

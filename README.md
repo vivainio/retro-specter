@@ -16,7 +16,10 @@ Linked git worktrees of a repository already in the set are skipped.
 
 ## How it works
 
-- Walks the first-parent history of `REV` (default `HEAD`). A commit counts as a PR if it is a
+- Walks the first-parent history of `REV`. By default that is each repository's remote default branch (`origin/HEAD`, e.g.
+  `origin/main`), not the branch you happen to have checked out; pass `HEAD` for the checkout.
+  A repository without a local `origin/HEAD` asks the remote with `--fetch`; no ref is written.
+  Without any remote it falls back to the branch's upstream, then `HEAD`. A commit counts as a PR if it is a
   merge commit, or if its message has a PR reference: GitHub `Merge pull request #N` / `(#N)`,
   Azure DevOps `Merged PR N`, or GitLab `See merge request !N`. `--mode merges|all` changes this.
   `git pull` merges (`Merge branch 'master' of <url>`, or merging the branch's own upstream back
@@ -112,6 +115,10 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
   exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
 
 `--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `--scan DIR` finds git checkouts
-recursively; `--fetch` runs `git fetch` first and dumps the branch's upstream. Linked worktrees of
+recursively; `--fetch` runs `git fetch` first; a repository whose fetch fails is skipped, not analyzed stale. `--unmerged` (dump; requires `--since`/`--months`/`--days`) also records commits on
+remote branches that are not in the walked revision, as `commit` records with `"unmerged":true` (the field is absent on merged and direct commits)
+and `branch` set to the branch name (`pr_merge` is null); a commit on several branches is listed
+once. With `--fetch`, branches already deleted on the remote are ignored; a squash-merged branch
+that still exists on the remote is reported as unmerged. Linked worktrees of
 a repository already in the set are skipped (the main checkout is kept). `complexity` accepts the
 same repo options. `--mode` applies to `dump` too, and `-n` there counts PRs and direct commits together.

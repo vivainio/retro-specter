@@ -103,6 +103,59 @@ impl Repo {
         (!name.is_empty() && name != "HEAD").then(|| name.to_string())
     }
 
+    /// The remote's default branch as a remote-tracking ref (e.g. `origin/main`), independent
+    /// of the checked-out branch. Reads `origin/HEAD`; with `ask_remote`, a repository lacking
+    /// it asks the remote (`ls-remote --symref`). Never writes any ref.
+    pub fn default_branch(&self, ask_remote: bool) -> Option<String> {
+        let exists = |rev: &str| {
+            self.run(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+                .is_ok()
+        };
+        if let Ok(out) = self.run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+            let rev = out.trim().to_string();
+            if exists(&rev) {
+                return Some(rev);
+            }
+        }
+        if !ask_remote {
+            return None;
+        }
+        let out = self.run(&["ls-remote", "--symref", "origin", "HEAD"]).ok()?;
+        let branch = out
+            .lines()
+            .find_map(|l| l.strip_prefix("ref: refs/heads/"))?
+            .split_whitespace()
+            .next()?;
+        let rev = format!("origin/{branch}");
+        exists(&rev).then_some(rev)
+    }
+
+    /// Remote-tracking branches of `origin` (e.g. `origin/feature-x`), without `origin/HEAD`.
+    pub fn remote_branches(&self) -> Result<Vec<String>> {
+        let out = self.run(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/remotes/origin",
+        ])?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|b| b.starts_with("origin/") && *b != "origin/HEAD")
+            .map(String::from)
+            .collect())
+    }
+
+    /// Names of the branches that currently exist on `origin` (`feature-x`, not
+    /// `origin/feature-x`), asked from the remote. Local remote-tracking refs can be stale:
+    /// a branch deleted after its PR was merged stays until pruned.
+    pub fn live_remote_branches(&self) -> Result<std::collections::HashSet<String>> {
+        let out = self.run(&["ls-remote", "--heads", "origin"])?;
+        Ok(out
+            .lines()
+            .filter_map(|l| l.split_once("\trefs/heads/").map(|(_, b)| b.to_string()))
+            .collect())
+    }
+
     /// The upstream of the current branch (e.g. `origin/main`), if it has one.
     pub fn upstream(&self) -> Option<String> {
         self.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])

@@ -19,9 +19,10 @@ pub enum Mode {
 
 #[derive(Args)]
 pub struct RepoArgs {
-    /// Revision to start walking back from.
-    #[arg(default_value = "HEAD")]
-    pub rev: String,
+    /// Revision to start walking back from. Default: each repository's remote default branch
+    /// (origin/HEAD, e.g. origin/main), not whatever happens to be checked out. Pass `HEAD`
+    /// for the checked-out branch.
+    pub rev: Option<String>,
 
     /// Path to a git repository (repeatable; default: current directory).
     #[arg(short = 'C', long = "repo")]
@@ -35,10 +36,17 @@ pub struct RepoArgs {
     #[arg(long, default_value_t = 6)]
     pub scan_depth: usize,
 
-    /// `git fetch` every repository first. A default `HEAD` then becomes the current
-    /// branch's upstream (e.g. origin/main) when it has one, so fresh history is analyzed.
+    /// `git fetch` every repository first, so fresh history is analyzed. Also lets a repository
+    /// without a local `origin/HEAD` ask the remote for its default branch.
     #[arg(long)]
     pub fetch: bool,
+
+    /// `dump` only: also record commits that are on remote branches but not yet in the walked
+    /// revision (unmerged work), tagged `"unmerged":true` with the branch name. With `--fetch`,
+    /// branches already deleted on the remote are ignored. A branch that was squash-merged but
+    /// not deleted still shows up, as its commits are not reachable from the target.
+    #[arg(long)]
+    pub unmerged: bool,
 
     /// Maximum number of PRs per repository (newest first).
     #[arg(short = 'n', long)]
@@ -124,22 +132,34 @@ impl RepoArgs {
                 Err(e) => return Err(e),
             }
         }
-        let repos = dedupe_worktrees(repos);
+        let mut repos = dedupe_worktrees(repos);
         if self.fetch {
-            repos.par_iter().for_each(|r| {
-                if let Err(e) = r.fetch() {
-                    eprintln!("warning: fetch failed for {}: {e:#}", r.name());
-                }
-            });
+            // A repository that can't be fetched is stale, so it is left out of the run.
+            let fetched: Vec<bool> = repos
+                .par_iter()
+                .map(|r| match r.fetch() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("skipping {}: fetch failed: {e:#}", r.name());
+                        false
+                    }
+                })
+                .collect();
+            let mut ok = fetched.into_iter();
+            repos.retain(|_| ok.next().unwrap_or(true));
         }
         Ok(repos)
     }
 
-    /// The revision to walk in `repo`: with --fetch, a default `HEAD` becomes the upstream.
+    /// The revision to walk in `repo`: the one given, else the remote's default branch, falling
+    /// back to the current branch's upstream and finally `HEAD` (e.g. no remote).
     pub fn rev_for(&self, repo: &git::Repo) -> String {
-        match (self.fetch, self.rev.as_str()) {
-            (true, "HEAD") => repo.upstream().unwrap_or_else(|| self.rev.clone()),
-            _ => self.rev.clone(),
+        match &self.rev {
+            Some(rev) => rev.clone(),
+            None => repo
+                .default_branch(self.fetch)
+                .or_else(|| repo.upstream())
+                .unwrap_or_else(|| "HEAD".to_string()),
         }
     }
 
