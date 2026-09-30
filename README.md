@@ -54,24 +54,44 @@ functions whose complexity grew the most.
 Generated files (`*.Designer.cs`, `*.g.cs`, `*_pb2.py`, …) are excluded by default. Use
 `--exclude GLOB` to add more, or `--no-default-excludes` to turn this off.
 
-## ai subcommand
+## dump and ai subcommands
 
-Aggregates AI usage from commit messages. It reads messages and `git diff --numstat` only: no
-complexity analysis, any language, PRs with no code included.
+`dump` writes a raw record of a repository's PRs and commits as JSONL; `ai` aggregates AI usage
+from such dumps. Dumping is the only step that touches git, so you dump once and analyze many
+times, or write your own scripts against the dump.
 
 ```
-retro-specter ai [REV] [-C <repo>]... [--scan <dir>]... [--fetch] [--by pr|commit] [--list] [-f table|json|jsonl|csv]
+retro-specter dump [REV] [-C <repo>]... [--scan <dir>]... [--fetch] [--months N | --days N] -o <dir>
+retro-specter ai [FILE|DIR]... [--by pr|commit] [--list] [-f table|json|jsonl|csv]
 ```
 
-- Models come from `Co-Authored-By:` trailers (Claude, Copilot, Gemini, GPT, Cursor, Aider, …);
-  tools from `Generated with …` lines.
-- `--by pr` (default): one row per merged PR. It combines the trailers of every commit in the PR
-  and lists the models in one field, most commits first (`Claude Sonnet 5 (3), Claude Opus 5.5 (2)`).
-  Commits on the branch that aren't in any PR are reported separately as **direct commits**.
-  `--by commit`: one row per non-merge commit.
-- Reports rows, commits, lines added/removed per model / tool, with vs. without AI credit, per repo.
-- `--months N` / `--days N` limit the window (shorthand for `--since "N months ago"`); both
-  subcommands accept them.
-- `--scan DIR` finds git checkouts recursively (`--scan-depth`, default 6); `--fetch` runs
-  `git fetch` first and analyzes the branch's upstream. Both subcommands accept them.
-  Linked worktrees of a repository already in the set are skipped (the main checkout is kept).
+**Dump format** (one file per repo, `<dir>/<repo>.jsonl`; a single repo without `-o` goes to stdout):
+
+- `{"type":"pr", repo, sha, pr, branch, author, date, subject, message, added, removed, commits, squash}`
+  a merged PR (merge commit, or squash/numbered commit). `added`/`removed` are its net change
+  against the target branch.
+- `{"type":"commit", repo, sha, pr_merge, pr, branch, author, date, subject, message, added, removed}`
+  a non-merge commit. `pr_merge` is the `sha` of the PR record that brought it in (`null` for
+  a direct commit), so commits group into PRs by `(repo, pr_merge)`. A squash-merged PR has
+  both records for the same sha; rebase-merged commits look like direct commits.
+- `branch` is the merged branch's name taken from the merge subject. For merges without a PR
+  number (`pr: null`) it is the pseudo-PR label (`Merge branch 'x'`, `Merge x into main`, ...).
+- A `git pull` merge (`Merge branch 'master' of <url>`, or merging the trunk into itself) is not
+  a PR: it emits no `pr` record, and the commits it brought in are dumped as direct commits.
+- `message` is the full commit message, so the AI vendor list can change without re-dumping.
+
+**ai**: models come from `Co-Authored-By:` trailers (Claude, Copilot, Gemini, GPT, Cursor, Aider, …),
+tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (default: stdin).
+
+- `--by pr` (default): one row per PR, models listed most commits first
+  (`Claude Sonnet 5 (3), Claude Opus 5.5 (2)`); commits outside any PR are reported separately as
+  direct commits. `--by commit`: one row per commit.
+- Line counts for a PR are its net change, so work a later commit reverts isn't counted twice.
+  Git can't say which surviving lines came from which commit, so AI lines for a PR mixing AI and
+  other commits are the net lines scaled by the AI commits' share of commit churn (an estimate;
+  exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
+
+`--months N` / `--days N` (dump time) limit the window; `--scan DIR` finds git checkouts
+recursively; `--fetch` runs `git fetch` first and dumps the branch's upstream. Linked worktrees of
+a repository already in the set are skipped (the main checkout is kept). `complexity` accepts the
+same repo options.

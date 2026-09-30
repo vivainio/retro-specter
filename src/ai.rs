@@ -4,11 +4,15 @@ use regex::Regex;
 use serde::Serialize;
 use std::sync::LazyLock;
 
-/// A model or tool credited in commit messages, with how many commits credit it.
+/// A model or tool credited in commit messages.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Credit {
     pub name: String,
+    /// Commits crediting it.
     pub commits: u32,
+    /// Lines added / removed by those commits.
+    pub added: u64,
+    pub removed: u64,
 }
 
 /// AI attribution found in the commit message(s) of a PR or commit.
@@ -18,8 +22,10 @@ pub struct Usage {
     pub models: Vec<Credit>,
     /// From `Generated with ...` lines, e.g. `Claude Code`; most commits first.
     pub tools: Vec<Credit>,
-    /// Number of commits that credit any model or tool.
+    /// Commits that credit any model or tool, and the lines they added / removed.
     pub ai_commits: u32,
+    pub ai_added: u64,
+    pub ai_removed: u64,
 }
 
 impl Usage {
@@ -41,38 +47,43 @@ static CO_AUTHOR: LazyLock<Regex> =
 static GENERATED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?im)generated\s+(?:with|by|using)\s+\[?([^\]\(\n]+)").unwrap());
 
-/// AI attribution in a single commit message; every credit counts one commit.
+/// AI attribution in a single commit message; each credit counts that one commit.
 pub fn detect(message: &str) -> Usage {
     let mut usage = Usage::default();
     for c in CO_AUTHOR.captures_iter(message) {
         let name = c[1].trim();
         let email = c.get(2).map_or("", |m| m.as_str());
         if VENDOR.is_match(name) || VENDOR.is_match(email) {
-            credit(&mut usage.models, name, 1);
+            credit(&mut usage.models, name, 1, 0, 0, true);
         }
     }
     for c in GENERATED.captures_iter(message) {
         let tool = c[1].trim().trim_end_matches(['.', ')', ']', ' ']);
         if VENDOR.is_match(tool) {
-            credit(&mut usage.tools, tool, 1);
+            credit(&mut usage.tools, tool, 1, 0, 0, true);
         }
     }
     usage.ai_commits = !usage.is_empty() as u32;
     usage
 }
 
-/// Combines the messages of a PR's commits. Models and tools are ordered by how many
-/// commits credit them (ties keep the order first seen).
-pub fn combine<'a>(messages: impl IntoIterator<Item = &'a str>) -> Usage {
+/// Combines the commits of a PR, given as `(message, lines added, lines removed)`. Models and
+/// tools are ordered by how many commits credit them (ties keep the order first seen).
+pub fn combine<'a>(commits: impl IntoIterator<Item = (&'a str, u64, u64)>) -> Usage {
     let mut total = Usage::default();
-    for m in messages {
-        let u = detect(m);
-        total.ai_commits += u.ai_commits;
+    for (message, added, removed) in commits {
+        let u = detect(message);
+        if u.is_empty() {
+            continue;
+        }
+        total.ai_commits += 1;
+        total.ai_added += added;
+        total.ai_removed += removed;
         for c in u.models {
-            credit(&mut total.models, &c.name, c.commits);
+            credit(&mut total.models, &c.name, 1, added, removed, false);
         }
         for c in u.tools {
-            credit(&mut total.tools, &c.name, c.commits);
+            credit(&mut total.tools, &c.name, 1, added, removed, false);
         }
     }
     total.models.sort_by(|a, b| b.commits.cmp(&a.commits));
@@ -80,12 +91,21 @@ pub fn combine<'a>(messages: impl IntoIterator<Item = &'a str>) -> Usage {
     total
 }
 
-fn credit(list: &mut Vec<Credit>, name: &str, commits: u32) {
+/// Adds to the credit for `name` (case-insensitive). With `once`, a name that's already
+/// listed is left alone (the same trailer repeated in one message).
+fn credit(list: &mut Vec<Credit>, name: &str, commits: u32, added: u64, removed: u64, once: bool) {
     match list.iter_mut().find(|c| c.name.eq_ignore_ascii_case(name)) {
-        Some(c) => c.commits += commits,
+        Some(_) if once => {}
+        Some(c) => {
+            c.commits += commits;
+            c.added += added;
+            c.removed += removed;
+        }
         None => list.push(Credit {
             name: name.to_string(),
             commits,
+            added,
+            removed,
         }),
     }
 }
@@ -126,21 +146,39 @@ mod tests {
     }
 
     #[test]
-    fn combine_orders_by_commit_count() {
+    fn repeated_trailer_counts_once() {
+        let u = detect(
+            "Co-authored-by: Claude <a@anthropic.com>\nCo-authored-by: claude <a@anthropic.com>",
+        );
+        assert_eq!(u.models.len(), 1);
+        assert_eq!(u.models[0].commits, 1);
+    }
+
+    #[test]
+    fn combine_orders_by_commit_count_and_sums_lines() {
         let opus = "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>";
         let sonnet = "Co-Authored-By: claude sonnet 5 <noreply@anthropic.com>";
+        // tie (2 each) keeps first seen
         let u = combine([
-            opus,
-            sonnet,
-            "plain",
-            sonnet,
-            "Co-authored-by: CLAUDE OPUS 5.5 <a@anthropic.com>",
+            (opus, 1, 0),
+            (sonnet, 2, 0),
+            ("plain", 100, 100),
+            (sonnet, 4, 1),
+            (opus, 8, 0),
         ]);
-        // opus: 2 commits, sonnet: 2 commits -> tie keeps first seen (opus)
         assert_eq!(names(&u.models), vec!["Claude Opus 5.5", "claude sonnet 5"]);
-        let u = combine([sonnet, sonnet, opus, "plain"]);
+        let u = combine([
+            (sonnet, 2, 0),
+            (sonnet, 4, 1),
+            (opus, 8, 3),
+            ("plain", 5, 5),
+        ]);
         assert_eq!(names(&u.models), vec!["claude sonnet 5", "Claude Opus 5.5"]);
-        assert_eq!(u.models[0].commits, 2);
-        assert_eq!(u.ai_commits, 3);
+        assert_eq!(
+            (u.models[0].commits, u.models[0].added, u.models[0].removed),
+            (2, 6, 1)
+        );
+        // lines and commits of the non-AI commit are excluded
+        assert_eq!((u.ai_commits, u.ai_added, u.ai_removed), (3, 14, 4));
     }
 }

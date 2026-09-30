@@ -3,8 +3,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use retro_specter::complexity::Language;
 use retro_specter::repos::RepoArgs;
-use retro_specter::{analyze, git, report, usage};
+use retro_specter::{analyze, dump, git, report, usage};
 use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
 
 /// Retrospective analysis of merged PRs in git history.
 #[derive(Parser)]
@@ -22,21 +23,35 @@ struct Cli {
 enum Command {
     /// Measure the indentation-based complexity each PR added or removed (C#, Python).
     Complexity(ComplexityArgs),
-    /// Aggregate AI usage from commit messages (Co-Authored-By trailers, "Generated with"
-    /// lines) and lines added/removed per PR. Reads messages and numstat only: any language.
+    /// Write the raw dump: one JSON object per PR and per commit, with which PR each commit
+    /// belongs to. Aggregators (`ai`, your own scripts) read this instead of git.
+    Dump(DumpArgs),
+    /// Aggregate AI usage (Co-Authored-By trailers, "Generated with" lines) and lines
+    /// added/removed from dump files. Never touches git.
     Ai(AiArgs),
 }
 
 #[derive(Args)]
-struct AiArgs {
+struct DumpArgs {
     #[command(flatten)]
     repos: RepoArgs,
+
+    /// Write one `<repo>.jsonl` per repository into this directory (created if needed).
+    /// Without it, a single repository is written to stdout; several need this.
+    #[arg(short, long, value_name = "DIR")]
+    out_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct AiArgs {
+    /// Dump files, or directories of `*.jsonl` (default: read stdin).
+    files: Vec<PathBuf>,
 
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
     format: Format,
 
-    /// Aggregate per merged PR (models of all its commits combined, most commits first)
-    /// or per individual commit.
+    /// Aggregate per merged PR (models of all its commits combined, most commits first;
+    /// commits outside any PR are reported separately) or per individual commit.
     #[arg(long, value_enum, default_value_t = usage::Unit::Pr)]
     by: usage::Unit,
 
@@ -130,27 +145,47 @@ fn run() -> Result<()> {
     }
     match cli.command {
         Command::Complexity(args) => complexity(&args),
+        Command::Dump(args) => dump_cmd(&args),
         Command::Ai(args) => ai(&args),
     }
 }
 
-fn ai(cli: &AiArgs) -> Result<()> {
+fn dump_cmd(cli: &DumpArgs) -> Result<()> {
     let repos = cli.repos.open_repos()?;
-    let mut all = Vec::new();
+    let Some(dir) = &cli.out_dir else {
+        anyhow::ensure!(
+            repos.len() == 1,
+            "{} repositories found; pass --out-dir to write one file per repository",
+            repos.len()
+        );
+        let records = dump::dump_repo(&repos[0], &cli.repos)?;
+        let mut out = BufWriter::new(io::stdout().lock());
+        dump::write_lines(&mut out, &records)?;
+        return Ok(out.flush()?);
+    };
+    let mut used = std::collections::HashSet::new();
     for repo in &repos {
-        let r = match cli.by {
-            usage::Unit::Pr => cli
-                .repos
-                .select_with_direct(repo)
-                .and_then(|sel| usage::by_pr(repo, &sel)),
-            usage::Unit::Commit => usage::by_commit(repo, &cli.repos),
-        };
-        match r {
-            Ok(r) => all.extend(r),
+        let file = dump::file_name(repo, &mut used);
+        // A failing repository leaves its previous dump untouched.
+        match dump::dump_repo(repo, &cli.repos).and_then(|r| {
+            dump::write_file(dir, &file, &r)?;
+            Ok(r.len())
+        }) {
+            Ok(n) => eprintln!(
+                "{}: {n} records -> {}",
+                repo.name(),
+                dir.join(&file).display()
+            ),
             Err(e) if repos.len() > 1 => eprintln!("skipping {}: {e:#}", repo.name()),
             Err(e) => return Err(e),
         }
     }
+    Ok(())
+}
+
+fn ai(cli: &AiArgs) -> Result<()> {
+    let records = dump::read(&cli.files)?;
+    let all = usage::rows(&records, cli.by);
 
     let mut out = BufWriter::new(io::stdout().lock());
     match cli.format {

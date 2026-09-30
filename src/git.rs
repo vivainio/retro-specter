@@ -17,6 +17,10 @@ pub struct Commit {
     pub date: String,
     pub subject: String,
     pub body: String,
+    /// Lines added / removed, all file types (0 unless the log was read with stats;
+    /// also 0 for merge commits, whose diff `git log` doesn't show).
+    pub added: u64,
+    pub removed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -90,6 +94,14 @@ impl Repo {
         self.run(&["fetch", "--quiet", "--tags"]).map(|_| ())
     }
 
+    /// Short name of the branch `rev` refers to, without any remote (`HEAD` -> `main`,
+    /// `origin/main` -> `main`); `None` for a detached HEAD.
+    pub fn branch_name(&self, rev: &str) -> Option<String> {
+        let out = self.run(&["rev-parse", "--abbrev-ref", rev]).ok()?;
+        let name = out.trim().rsplit('/').next()?;
+        (!name.is_empty() && name != "HEAD").then(|| name.to_string())
+    }
+
     /// The upstream of the current branch (e.g. `origin/main`), if it has one.
     pub fn upstream(&self) -> Option<String> {
         self.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
@@ -98,39 +110,50 @@ impl Repo {
             .filter(|s| !s.is_empty())
     }
 
-    /// Messages of the non-merge commits in `base..tip`, i.e. the commits a merged PR brought in.
-    pub fn branch_messages(&self, base: &str, tip: &str) -> Result<Vec<String>> {
-        let out = self.run(&[
-            "log",
-            "--no-color",
-            "--no-merges",
-            "--format=%B%x1e",
-            &format!("{base}..{tip}"),
-            "--",
-        ])?;
-        Ok(out
-            .split('\x1e')
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(String::from)
-            .collect())
+    /// Non-merge commits in `range` (e.g. `base..tip`), newest first, with lines added / removed.
+    pub fn commit_log(
+        &self,
+        range: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+        max_count: Option<usize>,
+    ) -> Result<Vec<Commit>> {
+        self.log(&["--no-merges"], range, since, until, max_count, true)
     }
 
-    /// Every non-merge commit reachable from `rev`, newest first, with lines added / removed.
-    pub fn commit_log(
+    /// Commits on the first-parent chain of `rev`, newest first. With `stats`, non-merge
+    /// commits carry their lines added / removed.
+    pub fn first_parent_log(
         &self,
         rev: &str,
         since: Option<&str>,
         until: Option<&str>,
+        stats: bool,
+    ) -> Result<Vec<Commit>> {
+        self.log(&["--first-parent"], rev, since, until, None, stats)
+    }
+
+    fn log(
+        &self,
+        flags: &[&str],
+        rev: &str,
+        since: Option<&str>,
+        until: Option<&str>,
         max_count: Option<usize>,
-    ) -> Result<Vec<(Commit, u64, u64)>> {
-        let mut args = vec![
-            "log".to_string(),
-            "--no-merges".into(),
-            "--numstat".into(),
-            "--no-color".into(),
-            "--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%b%x1f".into(),
-        ];
+        stats: bool,
+    ) -> Result<Vec<Commit>> {
+        let mut args: Vec<String> = [
+            "log",
+            "--no-color",
+            "--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%b%x1f",
+        ]
+        .iter()
+        .chain(flags)
+        .map(|s| s.to_string())
+        .collect();
+        if stats {
+            args.push("--numstat".into());
+        }
         args.extend(since.map(|s| format!("--since={s}")));
         args.extend(until.map(|u| format!("--until={u}")));
         args.extend(max_count.map(|n| format!("--max-count={n}")));
@@ -143,21 +166,27 @@ impl Repo {
             .filter_map(|rec| {
                 let mut f = rec.trim_start_matches('\n').split('\x1f');
                 let id = f.next().filter(|s| !s.is_empty())?.to_string();
-                let commit = Commit {
-                    id,
-                    parents: f
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .map(String::from)
-                        .collect(),
-                    author: f.next().unwrap_or("").to_string(),
-                    date: f.next().unwrap_or("").to_string(),
-                    subject: f.next().unwrap_or("").to_string(),
-                    body: f.next().unwrap_or("").trim().to_string(),
-                };
+                let parents = f
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+                let author = f.next().unwrap_or("").to_string();
+                let date = f.next().unwrap_or("").to_string();
+                let subject = f.next().unwrap_or("").to_string();
+                let body = f.next().unwrap_or("").trim().to_string();
                 let (added, removed) = sum_numstat(f.next().unwrap_or(""));
-                Some((commit, added, removed))
+                Some(Commit {
+                    id,
+                    parents,
+                    author,
+                    date,
+                    subject,
+                    body,
+                    added,
+                    removed,
+                })
             })
             .collect())
     }
@@ -202,51 +231,6 @@ impl Repo {
         child.stdout.take().unwrap().read_to_string(&mut out)?;
         child.wait()?;
         Ok(out.trim().to_string())
-    }
-
-    /// Commits on the first-parent chain of `rev`, newest first.
-    pub fn first_parent_log(
-        &self,
-        rev: &str,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> Result<Vec<Commit>> {
-        let mut args = vec![
-            "log".to_string(),
-            "--first-parent".into(),
-            "--no-color".into(),
-            "--format=%H%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%b%x1e".into(),
-        ];
-        if let Some(s) = since {
-            args.push(format!("--since={s}"));
-        }
-        if let Some(u) = until {
-            args.push(format!("--until={u}"));
-        }
-        args.push(rev.to_string());
-        args.push("--".into());
-
-        let out = self.run(&args)?;
-        Ok(out
-            .split('\x1e')
-            .filter_map(|rec| {
-                let mut f = rec.trim_start_matches('\n').split('\x1f');
-                let id = f.next().filter(|s| !s.is_empty())?.to_string();
-                Some(Commit {
-                    id,
-                    parents: f
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .map(String::from)
-                        .collect(),
-                    author: f.next().unwrap_or("").to_string(),
-                    date: f.next().unwrap_or("").to_string(),
-                    subject: f.next().unwrap_or("").to_string(),
-                    body: f.next().unwrap_or("").trim().to_string(),
-                })
-            })
-            .collect())
     }
 
     /// Zero-context diff between two revisions, restricted to `pathspecs`.

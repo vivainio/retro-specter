@@ -153,7 +153,7 @@ impl RepoArgs {
     }
 
     /// Like `select`, but also returns the first-parent commits that aren't PRs (pushed straight
-    /// to the branch), flagged `false`. `-n` counts both together. With `--mode all` every
+    /// to the branch, or pulled in by a sync merge), flagged `false`. `-n` counts both together. With `--mode all` every
     /// commit counts as a PR.
     pub fn select_with_direct(
         &self,
@@ -163,16 +163,24 @@ impl RepoArgs {
             &self.rev_for(repo),
             self.since_date().as_deref(),
             self.until.as_deref(),
+            true,
         )?;
+        let trunk = repo.branch_name(&self.rev_for(repo));
         Ok(commits
             .into_iter()
             .map(|c| {
                 let n = pr::pr_number(&c);
-                let is_pr = match self.mode {
-                    Mode::All => true,
-                    Mode::Merges => c.parents.len() > 1,
-                    Mode::Prs => c.parents.len() > 1 || n.is_some(),
-                };
+                // Merging the branch's own upstream back in (git pull) isn't a PR.
+                let sync = n.is_none()
+                    && c.parents.len() > 1
+                    && pr::merge_info(&c.subject)
+                        .is_some_and(|m| m.pull || Some(&m.branch) == trunk.as_ref());
+                let is_pr = !sync
+                    && match self.mode {
+                        Mode::All => true,
+                        Mode::Merges => c.parents.len() > 1,
+                        Mode::Prs => c.parents.len() > 1 || n.is_some(),
+                    };
                 (c, n, is_pr)
             })
             .take(self.max_count.unwrap_or(usize::MAX))
@@ -183,7 +191,8 @@ impl RepoArgs {
     pub fn select(&self, repo: &git::Repo) -> Result<Selected> {
         let rev = self.rev_for(repo);
         let since = self.since_date();
-        let commits = repo.first_parent_log(&rev, since.as_deref(), self.until.as_deref())?;
+        let commits =
+            repo.first_parent_log(&rev, since.as_deref(), self.until.as_deref(), false)?;
         Ok(commits
             .into_iter()
             .map(|c| {

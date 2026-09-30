@@ -2,6 +2,7 @@ pub mod ai;
 pub mod analyze;
 pub mod complexity;
 pub mod discover;
+pub mod dump;
 pub mod git;
 pub mod pr;
 pub mod report;

@@ -1,11 +1,8 @@
-//! AI usage per PR or per commit, read from commit messages only (any language).
+//! AI usage aggregated from a raw dump (see `dump`); never touches git.
 
 use crate::ai::{self, Credit, Usage};
-use crate::git::{Commit, Repo};
-use crate::repos::RepoArgs;
-use anyhow::Result;
+use crate::dump::{CommitRec, Record};
 use clap::ValueEnum;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -13,9 +10,9 @@ use std::io::{self, Write};
 /// What one row of the report is.
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
 pub enum Unit {
-    /// Merged PRs; the models of all commits in the PR are combined, most commits first.
+    /// Merged PRs (models of all their commits combined, most commits first) plus direct commits.
     Pr,
-    /// Individual commits (merge commits excluded).
+    /// Individual commits.
     Commit,
 }
 
@@ -25,7 +22,7 @@ pub enum Unit {
 pub enum Kind {
     /// A merged PR (all its commits combined).
     Pr,
-    /// A commit pushed straight to the branch, outside any PR.
+    /// A commit outside any PR.
     Direct,
     /// A single commit (`--by commit`).
     Commit,
@@ -48,82 +45,135 @@ pub struct Row {
     /// The PR's merge / squash commit, or the commit itself.
     pub commit: String,
     pub pr: Option<u64>,
+    /// Merged branch name: the label of a PR that has no number.
+    pub branch: Option<String>,
     pub author: String,
     pub date: String,
     pub subject: String,
-    /// Commits in the PR (always 1 per commit).
+    /// Commits in the row (1 unless it's a PR).
     pub commits: u32,
-    /// Lines added / removed, all file types.
+    /// Lines added / removed, all file types. For a PR this is its net change against the
+    /// target branch, so lines a later commit rewrote or reverted don't count twice.
     pub added: u64,
     pub removed: u64,
+    /// Sum over the row's commits of their own lines (>= the net figures when commits
+    /// undo each other's work). Equals `added` / `removed` for a single commit.
+    pub churn_added: u64,
+    pub churn_removed: u64,
+    /// Lines credited to AI: the row's net lines scaled by the share of commit churn that
+    /// AI-credited commits account for. Exact for single commits and for PRs where all or
+    /// none of the commits credit AI; an estimate for mixed PRs.
+    pub ai_added: u64,
+    pub ai_removed: u64,
+    /// Per-commit facts: which models / tools, and the raw lines of the credited commits.
     pub ai: Usage,
 }
 
-/// One row per merged PR of `repo`, plus one per direct commit (`is_pr == false`).
-pub fn by_pr(repo: &Repo, selected: &[(Commit, Option<u64>, bool)]) -> Result<Vec<Row>> {
-    let name = repo.name();
-    let empty = repo.empty_tree()?;
-    selected
-        .par_iter()
-        .map(|(c, pr, is_pr)| {
-            let own = format!("{}\n\n{}", c.subject, c.body);
-            let base = c.parents.first();
-            // Trailers live on the branch commits, not on the merge commit itself.
-            let messages = match base {
-                Some(base) if *is_pr && c.parents.len() > 1 => repo.branch_messages(base, &c.id)?,
-                _ => Vec::new(),
-            };
-            let messages = if messages.is_empty() {
-                vec![own]
-            } else {
-                messages
-            };
-            let (added, removed) = repo.numstat(base.unwrap_or(&empty), &c.id)?;
-            Ok(Row {
-                kind: if *is_pr { Kind::Pr } else { Kind::Direct },
-                repo: name.clone(),
-                commit: c.id.clone(),
-                pr: *pr,
-                author: c.author.clone(),
-                date: c.date.clone(),
-                subject: c.subject.clone(),
-                commits: messages.len() as u32,
-                added,
-                removed,
-                ai: ai::combine(messages.iter().map(String::as_str)),
-            })
-        })
-        .collect()
+impl Row {
+    /// `x`, a share of this row's commit churn, scaled onto the row's net lines.
+    fn scale(&self, x: u64, churn: u64, net: u64) -> u64 {
+        if churn == 0 || x >= churn {
+            return if churn == 0 { 0 } else { net };
+        }
+        (x as u128 * net as u128 / churn as u128) as u64
+    }
+
+    fn scale_added(&self, x: u64) -> u64 {
+        self.scale(x, self.churn_added, self.added)
+    }
+
+    fn scale_removed(&self, x: u64) -> u64 {
+        self.scale(x, self.churn_removed, self.removed)
+    }
 }
 
-/// One row per non-merge commit reachable from the requested revision.
-pub fn by_commit(repo: &Repo, args: &RepoArgs) -> Result<Vec<Row>> {
-    let name = repo.name();
-    let log = repo.commit_log(
-        &args.rev_for(repo),
-        args.since_date().as_deref(),
-        args.until.as_deref(),
-        args.max_count,
-    )?;
-    Ok(log
-        .into_iter()
-        .map(|(c, added, removed)| {
-            let ai = ai::detect(&format!("{}\n\n{}", c.subject, c.body));
-            Row {
-                kind: Kind::Commit,
-                repo: name.clone(),
-                pr: crate::pr::pr_number(&c),
-                commit: c.id,
-                author: c.author,
-                date: c.date,
-                subject: c.subject,
-                commits: 1,
-                added,
-                removed,
-                ai,
+/// Turns dump records into report rows, in dump order.
+pub fn rows(records: &[Record], unit: Unit) -> Vec<Row> {
+    let commit_row = |c: &CommitRec, kind| Row {
+        churn_added: c.added,
+        churn_removed: c.removed,
+        ai_added: if ai::detect(&c.message).is_empty() {
+            0
+        } else {
+            c.added
+        },
+        ai_removed: if ai::detect(&c.message).is_empty() {
+            0
+        } else {
+            c.removed
+        },
+        kind,
+        repo: c.repo.clone(),
+        commit: c.sha.clone(),
+        pr: c.pr,
+        branch: c.branch.clone(),
+        author: c.author.clone(),
+        date: c.date.clone(),
+        subject: c.subject.clone(),
+        commits: 1,
+        added: c.added,
+        removed: c.removed,
+        ai: ai::combine([(c.message.as_str(), c.added, c.removed)]),
+    };
+    if unit == Unit::Commit {
+        return records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Commit(c) => Some(commit_row(c, Kind::Commit)),
+                Record::Pr(_) => None,
+            })
+            .collect();
+    }
+
+    let mut members: HashMap<(&str, &str), Vec<&CommitRec>> = HashMap::new();
+    for r in records {
+        if let Record::Commit(c) = r
+            && let Some(m) = &c.pr_merge
+        {
+            members.entry((&c.repo, m)).or_default().push(c);
+        }
+    }
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Commit(c) if c.pr_merge.is_none() => Some(commit_row(c, Kind::Direct)),
+            Record::Commit(_) => None,
+            Record::Pr(p) => {
+                let ms = members
+                    .get(&(p.repo.as_str(), p.sha.as_str()))
+                    .map_or(&[][..], Vec::as_slice);
+                // An empty merge has no commits of its own; its message is all there is.
+                let ai = if ms.is_empty() {
+                    ai::combine([(p.message.as_str(), 0, 0)])
+                } else {
+                    ai::combine(ms.iter().map(|c| (c.message.as_str(), c.added, c.removed)))
+                };
+                let churn_added: u64 = ms.iter().map(|c| c.added).sum();
+                let churn_removed: u64 = ms.iter().map(|c| c.removed).sum();
+                let mut row = Row {
+                    churn_added,
+                    churn_removed,
+                    ai_added: 0,
+                    ai_removed: 0,
+                    kind: Kind::Pr,
+                    repo: p.repo.clone(),
+                    commit: p.sha.clone(),
+                    pr: p.pr,
+                    branch: p.branch.clone(),
+                    author: p.author.clone(),
+                    date: p.date.clone(),
+                    subject: p.subject.clone(),
+                    commits: ms.len() as u32,
+                    added: p.added,
+                    removed: p.removed,
+                    ai,
+                };
+                row.ai_added = row.scale_added(row.ai.ai_added);
+                row.ai_removed = row.scale_removed(row.ai.ai_removed);
+                Some(row)
             }
         })
-        .collect())
+        .collect()
 }
 
 fn credits(list: &[Credit], counts: bool) -> String {
@@ -152,17 +202,19 @@ pub fn table(out: &mut impl Write, rows: &[Row], unit: Unit, detail: bool) -> io
             .join(" | ");
             writeln!(
                 out,
-                "{:<20}  {:<10}  {:>6}  {:<9}  {:>7}  {:>7}  {:<40}  {}",
+                "{:<20}  {:<10}  {:>14}  {:<9}  {:>7}  {:>7}  {:>7}  {:<40}  {}",
                 trunc(&r.repo, 20),
                 r.date.get(..10).unwrap_or(&r.date),
-                match (r.kind, r.pr) {
-                    (Kind::Direct, _) => "direct".into(),
-                    (_, Some(n)) => format!("#{n}"),
+                match (r.kind, r.pr, &r.branch) {
+                    (Kind::Direct, ..) => "direct".into(),
+                    (_, Some(n), _) => format!("#{n}"),
+                    (_, None, Some(b)) => trunc(b, 14),
                     _ => String::new(),
                 },
                 &r.commit[..9.min(r.commit.len())],
                 r.added,
                 r.removed,
+                r.ai_added,
                 trunc(&ai, 40),
                 trunc(&r.subject, 60)
             )?;
@@ -192,31 +244,32 @@ struct Agg {
 }
 
 /// `pr_mode`: rows are PRs, so also show how many commits each entry accounts for.
+/// Line counts are net; see `Row::ai_added` for how AI lines are attributed.
 fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io::Result<()> {
     if rows.is_empty() {
         return writeln!(out, "nothing found");
     }
-    let pct = |n: usize, d: usize| 100.0 * n as f64 / d as f64;
+    let pct = |n: u64, d: u64| 100.0 * n as f64 / d.max(1) as f64;
     let total_commits: u64 = rows.iter().map(|r| r.commits as u64).sum();
     let ai_commits: u64 = rows.iter().map(|r| r.ai.ai_commits as u64).sum();
-    let ai_rows = rows.iter().filter(|r| !r.ai.is_empty()).count();
+    let ai_rows = rows.iter().filter(|r| !r.ai.is_empty()).count() as u64;
     write!(
         out,
-        "{ai_rows} of {} {} credit AI ({:.0}%)",
+        "{ai_rows} of {} {} include AI-credited commits ({:.0}%)",
         rows.len(),
         noun.to_lowercase(),
-        pct(ai_rows, rows.len())
+        pct(ai_rows, rows.len() as u64)
     )?;
     if pr_mode {
         write!(
             out,
             "; {ai_commits} of {total_commits} commits ({:.0}%)",
-            pct(ai_commits as usize, total_commits as usize)
+            pct(ai_commits, total_commits)
         )?;
     }
     writeln!(
         out,
-        "\n(an entry crediting several models counts under each)"
+        "\n(lines are PR net lines; for PRs mixing AI and other commits the AI share is estimated from commit churn; an entry crediting several models counts under each)"
     )?;
 
     let commits_col = |a: &Agg| {
@@ -248,7 +301,7 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
             "{:<30}  {:>5}  {:>4.0}%{}  {:>9}  {:>9}",
             trunc(&a.label, 30),
             a.units,
-            pct(a.units, rows.len()),
+            pct(a.units as u64, rows.len() as u64),
             commits_col(a),
             a.added,
             a.removed
@@ -266,8 +319,8 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
                 }
                 a.units += 1;
                 a.commits += c.commits as u64;
-                a.added += r.added;
-                a.removed += r.removed;
+                a.added += r.scale_added(c.added);
+                a.removed += r.scale_removed(c.removed);
             }
         }
         let mut v: Vec<_> = m.into_values().collect();
@@ -287,47 +340,55 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
         }
     }
 
-    let mut any = Agg {
-        label: "(any AI credit)".into(),
+    // Commit-level split: each row counts the entries containing such commits.
+    let mut ai = Agg {
+        label: "(AI-credited commits)".into(),
         ..Agg::default()
     };
-    let mut none = Agg {
-        label: "(no attribution)".into(),
+    let mut human = Agg {
+        label: "(other commits)".into(),
         ..Agg::default()
     };
     for r in rows {
-        let a = if r.ai.is_empty() { &mut none } else { &mut any };
-        a.units += 1;
-        a.commits += (r.commits - r.ai.ai_commits) as u64 * r.ai.is_empty() as u64
-            + r.ai.ai_commits as u64 * !r.ai.is_empty() as u64;
-        a.added += r.added;
-        a.removed += r.removed;
+        let other = (r.commits - r.ai.ai_commits) as u64;
+        if r.ai.ai_commits > 0 {
+            ai.units += 1;
+            ai.commits += r.ai.ai_commits as u64;
+            ai.added += r.ai_added;
+            ai.removed += r.ai_removed;
+        }
+        if other > 0 {
+            human.units += 1;
+            human.commits += other;
+            human.added += r.added - r.ai_added;
+            human.removed += r.removed - r.ai_removed;
+        }
     }
     head(out, "TOTAL")?;
-    line(out, &any)?;
-    line(out, &none)?;
+    line(out, &ai)?;
+    line(out, &human)?;
 
-    let mut repos: Vec<(Agg, usize)> = Vec::new(); // (everything, entries crediting AI)
+    // (everything, entries with AI, AI lines added / removed)
+    let mut repos: Vec<(Agg, u64, u64, u64)> = Vec::new();
     for r in rows {
         let i = repos
             .iter()
             .position(|x| x.0.label == r.repo)
             .unwrap_or_else(|| {
-                repos.push((
-                    Agg {
-                        label: r.repo.clone(),
-                        ..Agg::default()
-                    },
-                    0,
-                ));
+                let a = Agg {
+                    label: r.repo.clone(),
+                    ..Agg::default()
+                };
+                repos.push((a, 0, 0, 0));
                 repos.len() - 1
             });
-        let (a, ai) = &mut repos[i];
+        let (a, n_ai, ai_add, ai_rem) = &mut repos[i];
         a.units += 1;
-        a.commits += r.commits as u64;
         a.added += r.added;
         a.removed += r.removed;
-        *ai += !r.ai.is_empty() as usize;
+        *n_ai += !r.ai.is_empty() as u64;
+        *ai_add += r.ai_added;
+        *ai_rem += r.ai_removed;
     }
     if repos.len() > 1 {
         repos.sort_by(|a, b| {
@@ -337,19 +398,21 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
         });
         writeln!(
             out,
-            "\n{:<30}  {:>5}  {:>5}  {:>5}  {:>9}  {:>9}",
-            "REPO", noun, "AI", "AI%", "+LINES", "-LINES"
+            "\n{:<30}  {:>5}  {:>5}  {:>5}  {:>9}  {:>9}  {:>9}  {:>9}",
+            "REPO", noun, "AI", "AI%", "+LINES", "-LINES", "AI +LINES", "AI -LINES"
         )?;
-        for (a, ai) in &repos {
+        for (a, n_ai, ai_add, ai_rem) in &repos {
             writeln!(
                 out,
-                "{:<30}  {:>5}  {:>5}  {:>4.0}%  {:>9}  {:>9}",
+                "{:<30}  {:>5}  {:>5}  {:>4.0}%  {:>9}  {:>9}  {:>9}  {:>9}",
                 trunc(&a.label, 30),
                 a.units,
-                ai,
-                pct(*ai, a.units),
+                n_ai,
+                pct(*n_ai, a.units as u64),
                 a.added,
-                a.removed
+                a.removed,
+                ai_add,
+                ai_rem
             )?;
         }
     }
@@ -360,7 +423,7 @@ fn summary(out: &mut impl Write, rows: &[&Row], pr_mode: bool, noun: &str) -> io
 pub fn csv(out: &mut impl Write, rows: &[Row]) -> io::Result<()> {
     writeln!(
         out,
-        "kind,repo,date,pr,commit,author,commits,ai_commits,lines_added,lines_removed,ai_models,ai_model_commits,ai_tools,ai_tool_commits,subject"
+        "kind,repo,date,pr,branch,commit,author,commits,ai_commits,lines_added,lines_removed,churn_added,churn_removed,ai_lines_added,ai_lines_removed,ai_models,ai_model_commits,ai_tools,ai_tool_commits,subject"
     )?;
     let names = |l: &[Credit]| {
         l.iter()
@@ -377,17 +440,22 @@ pub fn csv(out: &mut impl Write, rows: &[Row]) -> io::Result<()> {
     for r in rows {
         writeln!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.kind.name(),
             esc(&r.repo),
             r.date,
             r.pr.map(|n| n.to_string()).unwrap_or_default(),
+            esc(r.branch.as_deref().unwrap_or_default()),
             r.commit,
             esc(&r.author),
             r.commits,
             r.ai.ai_commits,
             r.added,
             r.removed,
+            r.churn_added,
+            r.churn_removed,
+            r.ai_added,
+            r.ai_removed,
             esc(&names(&r.ai.models)),
             counts(&r.ai.models),
             esc(&names(&r.ai.tools)),
