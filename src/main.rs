@@ -175,10 +175,15 @@ fn dump_cmd(cli: &DumpArgs) -> Result<()> {
         );
     }
     let mut used = std::collections::HashSet::new();
+    let files: Vec<String> = repos.iter().map(|r| dump::file_name(r, &mut used)).collect();
+    // Repositories are independent, so dump them in parallel; order is kept.
+    let results: Vec<_> = repos
+        .par_iter()
+        .map(|repo| dump::dump_repo(repo, &cli.repos))
+        .collect();
     let mut dumped = Vec::new(); // (repo name, file name, records)
-    for repo in &repos {
-        let file = dump::file_name(repo, &mut used);
-        match dump::dump_repo(repo, &cli.repos) {
+    for ((repo, file), result) in repos.iter().zip(files).zip(results) {
+        match result {
             Ok(r) => dumped.push((repo.name(), file, r)),
             // A failing repository leaves its previous dump untouched.
             Err(e) if repos.len() > 1 => eprintln!("skipping {}: {e:#}", repo.name()),

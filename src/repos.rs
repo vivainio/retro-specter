@@ -140,16 +140,22 @@ impl RepoArgs {
         let mut repos = dedupe_worktrees(repos);
         if self.fetch {
             // A repository that can't be fetched is stale, so it is left out of the run.
-            let fetched: Vec<bool> = repos
-                .par_iter()
-                .map(|r| match r.fetch() {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!("skipping {}: fetch failed: {e:#}", r.name());
-                        false
-                    }
-                })
-                .collect();
+            // Fetching waits on the network, not the CPU, so use a wider pool than --jobs.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads((rayon::current_num_threads() * 4).max(16))
+                .build()?;
+            let fetched: Vec<bool> = pool.install(|| {
+                repos
+                    .par_iter()
+                    .map(|r| match r.fetch() {
+                        Ok(()) => true,
+                        Err(e) => {
+                            eprintln!("skipping {}: fetch failed: {e:#}", r.name());
+                            false
+                        }
+                    })
+                    .collect()
+            });
             let mut ok = fetched.into_iter();
             repos.retain(|_| ok.next().unwrap_or(true));
         }

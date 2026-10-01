@@ -130,16 +130,20 @@ impl Repo {
         exists(&rev).then_some(rev)
     }
 
+    /// Unix time of a `git log --since` date such as `2026-09-23` or `1 week ago`.
+    pub fn since_timestamp(&self, since: &str) -> Result<i64> {
+        self.run(&["rev-parse", &format!("--since={since}")])?
+            .trim()
+            .strip_prefix("--max-age=")
+            .and_then(|t| t.parse().ok())
+            .context("could not parse the --since date")
+    }
+
     /// Remote-tracking branches of `origin` (e.g. `origin/feature-x`), without `origin/HEAD`,
     /// whose tip commit is no older than `since` (anything `git log --since` accepts). A branch
     /// whose newest commit predates the window holds nothing in it, so it needn't be walked.
     pub fn remote_branches_since(&self, since: &str) -> Result<Vec<String>> {
-        let cutoff: i64 = self
-            .run(&["rev-parse", &format!("--since={since}")])?
-            .trim()
-            .strip_prefix("--max-age=")
-            .and_then(|t| t.parse().ok())
-            .context("could not parse the --since date")?;
+        let cutoff = self.since_timestamp(since)?;
         let out = self.run(&[
             "for-each-ref",
             "--format=%(refname:short) %(committerdate:unix)",
