@@ -28,6 +28,12 @@ pub struct RepoArgs {
     #[arg(short = 'C', long = "repo")]
     pub repos: Vec<PathBuf>,
 
+    /// A repository to clone temporarily and analyze: `owner/repo` (GitHub over SSH) or any git
+    /// URL (repeatable). Cloned without file contents into the system temp directory and
+    /// deleted when the run ends. A clone is current, so `--fetch` skips it.
+    #[arg(short = 'R', long = "remote", value_name = "REPO")]
+    pub remotes: Vec<String>,
+
     /// Recursively find git checkouts under this directory (repeatable).
     #[arg(long, value_name = "DIR")]
     pub scan: Vec<PathBuf>,
@@ -122,7 +128,7 @@ impl RepoArgs {
             );
             dirs.extend(found);
         }
-        if dirs.is_empty() && self.scan.is_empty() {
+        if dirs.is_empty() && self.scan.is_empty() && self.remotes.is_empty() {
             dirs.push(PathBuf::from("."));
         }
         let mut seen = HashSet::new();
@@ -138,6 +144,26 @@ impl RepoArgs {
             }
         }
         let mut repos = dedupe_worktrees(repos);
+        if !self.remotes.is_empty() {
+            let root = std::sync::Arc::new(git::TempRoot::new()?);
+            // Cloning waits on the network, so use a wider pool than --jobs.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads((rayon::current_num_threads() * 2).max(8))
+                .build()?;
+            let cloned: Vec<Option<git::Repo>> = pool.install(|| {
+                self.remotes
+                    .par_iter()
+                    .map(|spec| match git::Repo::clone_remote(spec, &root) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            eprintln!("skipping {spec}: {e:#}");
+                            None
+                        }
+                    })
+                    .collect()
+            });
+            repos.extend(cloned.into_iter().flatten());
+        }
         if self.fetch {
             // A repository that can't be fetched is stale, so it is left out of the run.
             // Fetching waits on the network, not the CPU, so use a wider pool than --jobs.
@@ -147,7 +173,7 @@ impl RepoArgs {
             let fetched: Vec<bool> = pool.install(|| {
                 repos
                     .par_iter()
-                    .map(|r| match r.fetch() {
+                    .map(|r| match if r.is_temp() { Ok(()) } else { r.fetch() } {
                         Ok(()) => true,
                         Err(e) => {
                             eprintln!("skipping {}: fetch failed: {e:#}", r.name());

@@ -3,10 +3,43 @@
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 pub struct Repo {
     dir: PathBuf,
+    /// Keeps a temporary clone alive; the clone is deleted when the last `Repo` using it is
+    /// dropped. `None` for repositories that were already on disk.
+    _temp: Option<Arc<TempRoot>>,
+}
+
+/// A directory of temporary clones, deleted on drop.
+pub struct TempRoot(PathBuf);
+
+impl TempRoot {
+    pub fn new() -> Result<TempRoot> {
+        let dir = std::env::temp_dir().join(format!("retro-specter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        Ok(TempRoot(dir))
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A clone URL for `spec`: `owner/repo` means `git@github.com:owner/repo.git` (SSH, so it does
+/// not depend on which `gh` account is active); anything with a scheme, `@` or a path is used as is.
+pub fn remote_url(spec: &str) -> String {
+    let plain = !spec.contains("://") && !spec.contains('@') && !spec.starts_with(['/', '.']);
+    if plain && spec.matches('/').count() == 1 {
+        format!("git@github.com:{spec}.git")
+    } else {
+        spec.to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -38,10 +71,56 @@ impl Repo {
     pub fn open(dir: &Path) -> Result<Repo> {
         let repo = Repo {
             dir: dir.to_path_buf(),
+            _temp: None,
         };
         repo.run(&["rev-parse", "--git-dir"])
             .with_context(|| format!("{} is not a git repository", dir.display()))?;
         Ok(repo)
+    }
+
+    /// Clones `spec` (see `remote_url`) into `root` without a checkout and without file contents
+    /// (a blobless clone: history is complete, blobs are fetched when a diff needs them). The
+    /// clone is deleted when the returned `Repo` and its siblings are dropped.
+    pub fn clone_remote(spec: &str, root: &Arc<TempRoot>) -> Result<Repo> {
+        let url = remote_url(spec);
+        let name = url
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .rsplit(['/', ':'])
+            .next()
+            .filter(|n| !n.is_empty())
+            .unwrap_or("repo")
+            .to_string();
+        let mut dir = root.0.join(&name);
+        for n in 2.. {
+            if !dir.exists() {
+                break;
+            }
+            dir = root.0.join(format!("{name}-{n}"));
+        }
+        let out = Command::new("git")
+            .args(["clone", "--quiet", "--no-checkout", "--filter=blob:none", "--no-tags"])
+            .arg(&url)
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context("failed to run git")?;
+        if !out.status.success() {
+            bail!(
+                "git clone {url} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(Repo {
+            dir,
+            _temp: Some(root.clone()),
+        })
+    }
+
+    /// Whether this is a temporary clone, which is up to date by construction.
+    pub fn is_temp(&self) -> bool {
+        self._temp.is_some()
     }
 
     pub fn dir(&self) -> &Path {
@@ -495,5 +574,19 @@ new file mode 100644
         assert_eq!(d[1].old_path, None);
         assert_eq!(d[1].new_path.as_deref(), Some("new.cs"));
         assert_eq!(d[1].added, vec![(1, 3)]);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::remote_url;
+
+    #[test]
+    fn expands_owner_repo_only() {
+        assert_eq!(remote_url("basware/bt"), "git@github.com:basware/bt.git");
+        assert_eq!(remote_url("https://h/x/y.git"), "https://h/x/y.git");
+        assert_eq!(remote_url("git@h:x/y.git"), "git@h:x/y.git");
+        assert_eq!(remote_url("./local/repo"), "./local/repo");
+        assert_eq!(remote_url("a/b/c"), "a/b/c");
     }
 }

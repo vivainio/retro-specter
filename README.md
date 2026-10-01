@@ -114,7 +114,9 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
   other commits are the net lines scaled by the AI commits' share of commit churn (an estimate;
   exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
 
-`--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `--scan DIR` finds git checkouts
+`--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `-R owner/repo` (or any git URL; repeatable) clones a repository into the system temp directory
+without file contents (a blobless clone over SSH for `owner/repo`) and deletes it when the run
+ends, so repositories you don't have on disk can be included; `--scan DIR` finds git checkouts
 recursively; `--fetch` runs `git fetch` first; a repository whose fetch fails is skipped, not analyzed stale. Records carry `tickets`, an array of Jira-style keys (`FOO-123`) found in the branch name (any case)
 or in the commit message (upper case only; `UTF-8`, `SHA-256` and the like are ignored), each once,
 branch first; the field is absent when there are none. A commit inside a PR also gets the PR's
