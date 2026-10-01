@@ -169,9 +169,13 @@ impl Repo {
         Ok(sum_numstat(&out))
     }
 
-    /// `git fetch` from the default remote, so history is current before analysis.
+    /// `git fetch` from the default remote, so history is current before analysis. Tags are
+    /// not fetched: history doesn't need them, and a tag that moved on the remote (`latest`,
+    /// `v2`) makes `git fetch --tags` fail with "would clobber existing tag" while still
+    /// leaving the branches current. (No `--quiet`: output is captured, and a real error keeps
+    /// its message.)
     pub fn fetch(&self) -> Result<()> {
-        self.run(&["fetch", "--quiet", "--tags"]).map(|_| ())
+        self.run(&["fetch", "--no-tags"]).map(|_| ())
     }
 
     /// Short name of the branch `rev` refers to, without any remote (`HEAD` -> `main`,

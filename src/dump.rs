@@ -37,8 +37,10 @@ pub struct CommitRec {
     pub repo: String,
     pub sha: String,
     /// SHA of the PR record containing this commit; `None` for a direct commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_merge: Option<String>,
     /// That PR's number, when one could be parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<u64>,
     /// The merged branch's name, when the merge subject gives one (a pseudo-PR label for
     /// merges without a number).

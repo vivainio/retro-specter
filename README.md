@@ -86,7 +86,7 @@ means re-dumping.
   a merged PR (merge commit, or squash/numbered commit). `added`/`removed` are its net change
   against the target branch. `ai_*` are the credits in the merge commit's own message.
 - `{"type":"commit", repo, sha, pr_merge, pr, branch, author, author_email, date, ai_models, ai_tools, added, removed}`
-  a non-merge commit. `pr_merge` is the `sha` of the PR record that brought it in (`null` for
+  a non-merge commit. `pr_merge` is the `sha` of the PR record that brought it in (absent for
   a direct commit), so commits group into PRs by `(repo, pr_merge)`. A squash-merged PR has
   both records for the same sha; rebase-merged commits look like direct commits. `ai_models`
   come from `Co-Authored-By:` trailers and `ai_tools` from `Generated with …` lines.
