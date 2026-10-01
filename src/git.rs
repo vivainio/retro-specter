@@ -130,18 +130,30 @@ impl Repo {
         exists(&rev).then_some(rev)
     }
 
-    /// Remote-tracking branches of `origin` (e.g. `origin/feature-x`), without `origin/HEAD`.
-    pub fn remote_branches(&self) -> Result<Vec<String>> {
+    /// Remote-tracking branches of `origin` (e.g. `origin/feature-x`), without `origin/HEAD`,
+    /// whose tip commit is no older than `since` (anything `git log --since` accepts). A branch
+    /// whose newest commit predates the window holds nothing in it, so it needn't be walked.
+    pub fn remote_branches_since(&self, since: &str) -> Result<Vec<String>> {
+        let cutoff: i64 = self
+            .run(&["rev-parse", &format!("--since={since}")])?
+            .trim()
+            .strip_prefix("--max-age=")
+            .and_then(|t| t.parse().ok())
+            .context("could not parse the --since date")?;
         let out = self.run(&[
             "for-each-ref",
-            "--format=%(refname:short)",
+            "--format=%(refname:short) %(committerdate:unix)",
             "refs/remotes/origin",
         ])?;
         Ok(out
             .lines()
-            .map(str::trim)
-            .filter(|b| b.starts_with("origin/") && *b != "origin/HEAD")
-            .map(String::from)
+            .filter_map(|l| l.rsplit_once(' '))
+            .filter(|(b, t)| {
+                b.starts_with("origin/")
+                    && *b != "origin/HEAD"
+                    && t.parse::<i64>().is_ok_and(|t| t >= cutoff)
+            })
+            .map(|(b, _)| b.to_string())
             .collect())
     }
 

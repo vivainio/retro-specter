@@ -48,6 +48,11 @@ pub struct RepoArgs {
     #[arg(long)]
     pub unmerged: bool,
 
+    /// `dump` only: also store the text that identifies the work: `title` on PR records and
+    /// `subject` on commit records. Off by default, so dumps stay free of commit text.
+    #[arg(long)]
+    pub titles: bool,
+
     /// Maximum number of PRs per repository (newest first).
     #[arg(short = 'n', long)]
     pub max_count: Option<usize>,

@@ -78,7 +78,7 @@ retro-specter ai [FILE|DIR]... [--by pr|commit] [--list] [-f table|json|jsonl|cs
 ```
 
 **Dump format** (one file per repo, `<dir>/<repo>.jsonl`; a single repo without `-o` goes to stdout).
-No commit text is stored: no subjects, no messages. Records keep only what was derived from a
+No commit text is stored by default: no subjects, no messages (unless `--titles`). Records keep only what was derived from a
 message at dump time (PR number, merged branch name, AI credits), so changing the AI vendor list
 means re-dumping.
 
@@ -115,7 +115,12 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
   exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
 
 `--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `--scan DIR` finds git checkouts
-recursively; `--fetch` runs `git fetch` first; a repository whose fetch fails is skipped, not analyzed stale. `--unmerged` (dump; requires `--since`/`--months`/`--days`) also records commits on
+recursively; `--fetch` runs `git fetch` first; a repository whose fetch fails is skipped, not analyzed stale. Records carry `tickets`, an array of Jira-style keys (`FOO-123`) found in the branch name (any case)
+or in the commit message (upper case only; `UTF-8`, `SHA-256` and the like are ignored), each once,
+branch first; the field is absent when there are none. A commit inside a PR also gets the PR's
+tickets. Only the keys are stored, not the text. `--titles` (dump) adds `title` to `pr` records (the PR title: from a GitHub merge commit's body,
+without Azure DevOps' `Merged PR N:` prefix or a squash commit's `(#N)` suffix) and `subject` to
+`commit` records. Off by default, so dumps hold no commit text unless asked. `--unmerged` (dump; requires `--since`/`--months`/`--days`) also records commits on
 remote branches that are not in the walked revision, as `commit` records with `"unmerged":true` (the field is absent on merged and direct commits)
 and `branch` set to the branch name (`pr_merge` is null); a commit on several branches is listed
 once. With `--fetch`, branches already deleted on the remote are ignored; a squash-merged branch

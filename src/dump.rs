@@ -57,6 +57,13 @@ pub struct CommitRec {
     pub ai_tools: Vec<String>,
     pub added: u64,
     pub removed: u64,
+    /// Jira-style ticket keys in the merged / unmerged branch name or the commit message (or
+    /// the PR's, for a commit inside a PR); only the keys are kept. Omitted when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tickets: Vec<String>,
+    /// The commit's subject line; only with `--titles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     /// Present (as `true`) only on a remote branch that is not merged into the walked
     /// revision; `branch` names it. Merged and direct commits omit the field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -87,6 +94,12 @@ pub struct PrRec {
     /// Number of `commit` records that belong to it.
     pub commits: u32,
     pub squash: bool,
+    /// Jira-style ticket keys in the branch name or the merge / squash commit message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tickets: Vec<String>,
+    /// The PR's title; only with `--titles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Model and tool names credited by `c`'s message.
@@ -102,7 +115,15 @@ fn commit_rec(
     pr_merge: Option<&str>,
     pr: Option<u64>,
     branch: Option<&str>,
+    inherited: &[String],
+    titles: bool,
 ) -> Record {
+    let mut tickets = pr::tickets(branch, &[&c.subject, &c.body]);
+    for t in inherited {
+        if !tickets.contains(t) {
+            tickets.push(t.clone());
+        }
+    }
     Record::Commit(CommitRec {
         repo: name.to_string(),
         sha: c.id.clone(),
@@ -116,6 +137,8 @@ fn commit_rec(
         ai_tools: credits(c).1,
         added: c.added,
         removed: c.removed,
+        tickets,
+        subject: titles.then(|| c.subject.clone()),
         unmerged: false,
     })
 }
@@ -127,7 +150,7 @@ pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
     let items = args.select_with_direct(repo)?;
     let groups = items
         .par_iter()
-        .map(|(c, pr, is_pr)| one(repo, &name, c, *pr, *is_pr))
+        .map(|(c, pr, is_pr)| one(repo, &name, c, *pr, *is_pr, args.titles))
         .collect::<Result<Vec<_>>>()?;
     let mut records: Vec<Record> = groups.into_iter().flatten().collect();
     if args.unmerged {
@@ -148,7 +171,7 @@ fn unmerged_commits(repo: &Repo, name: &str, args: &RepoArgs) -> Result<Vec<Reco
     } else {
         None
     };
-    let mut branches = repo.remote_branches()?;
+    let mut branches = repo.remote_branches_since(&since)?;
     branches.sort();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -164,7 +187,7 @@ fn unmerged_commits(repo: &Repo, name: &str, args: &RepoArgs) -> Result<Vec<Reco
             None,
         )?;
         for c in log.iter().filter(|c| seen.insert(c.id.clone())) {
-            let Record::Commit(mut rec) = commit_rec(name, c, None, None, Some(short)) else {
+            let Record::Commit(mut rec) = commit_rec(name, c, None, None, Some(short), &[], args.titles) else {
                 unreachable!()
             };
             rec.unmerged = true;
@@ -174,10 +197,17 @@ fn unmerged_commits(repo: &Repo, name: &str, args: &RepoArgs) -> Result<Vec<Reco
     Ok(out)
 }
 
-fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Result<Vec<Record>> {
+fn one(
+    repo: &Repo,
+    name: &str,
+    c: &Commit,
+    pr: Option<u64>,
+    is_pr: bool,
+    titles: bool,
+) -> Result<Vec<Record>> {
     let merge = c.parents.len() > 1;
     if !is_pr && !merge {
-        return Ok(vec![commit_rec(name, c, None, None, None)]);
+        return Ok(vec![commit_rec(name, c, None, None, None, &[], titles)]);
     }
     if !is_pr {
         // A sync merge (git pull): the merge itself is noise, the commits it brought in
@@ -186,10 +216,11 @@ fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Res
         let members = repo.commit_log(&format!("{base}..{}", c.id), None, None, None)?;
         return Ok(members
             .iter()
-            .map(|m| commit_rec(name, m, None, None, None))
+            .map(|m| commit_rec(name, m, None, None, None, &[], titles))
             .collect());
     }
     let branch = pr::merge_info(&c.subject).map(|m| m.branch);
+    let tickets = pr::tickets(branch.as_deref(), &[&c.subject, &c.body]);
     let pr_rec = |added, removed, commits, squash| {
         Record::Pr(PrRec {
             repo: name.to_string(),
@@ -205,13 +236,15 @@ fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Res
             removed,
             commits,
             squash,
+            tickets: tickets.clone(),
+            title: titles.then(|| pr::title(c)),
         })
     };
     if !merge {
         // Squash / rebase-numbered commit: the commit is the whole PR.
         return Ok(vec![
             pr_rec(c.added, c.removed, 1, true),
-            commit_rec(name, c, Some(&c.id), pr, None),
+            commit_rec(name, c, Some(&c.id), pr, None, &[], titles),
         ]);
     }
     let base = &c.parents[0];
@@ -221,7 +254,7 @@ fn one(repo: &Repo, name: &str, c: &Commit, pr: Option<u64>, is_pr: bool) -> Res
     out.extend(
         members
             .iter()
-            .map(|m| commit_rec(name, m, Some(&c.id), pr, branch.as_deref())),
+            .map(|m| commit_rec(name, m, Some(&c.id), pr, branch.as_deref(), &tickets, titles)),
     );
     Ok(out)
 }
@@ -421,6 +454,8 @@ mod tests {
             ai_tools: vec![],
             added: 0,
             removed: 0,
+            tickets: vec![],
+            subject: None,
             unmerged: false,
         })
     }
