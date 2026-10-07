@@ -59,6 +59,12 @@ pub struct RepoArgs {
     #[arg(long)]
     pub titles: bool,
 
+    /// `dump` only: add GitHub's view of each PR as `github` on PR records (timings, labels,
+    /// merger, reviews), fetched with `gh api graphql` for repositories whose `origin` is on
+    /// GitHub. Needs an authenticated `gh`.
+    #[arg(long)]
+    pub github: bool,
+
     /// Maximum number of PRs per repository (newest first).
     #[arg(short = 'n', long)]
     pub max_count: Option<usize>,

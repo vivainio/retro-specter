@@ -114,6 +114,16 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
   other commits are the net lines scaled by the AI commits' share of commit churn (an estimate;
   exact when all or none of the commits credit AI). CSV/JSON also carry the raw per-commit churn.
 
+`--github` (dump) adds a `github` object to `pr` records from the GitHub GraphQL API, via `gh api graphql`
+(so it needs an authenticated `gh`; the repository's `origin` must be on GitHub, and an SSH host alias without a dot
+counts as github.com). One query fetches 100 PRs, newest-updated first, and stops once past the window.
+Fields: `created_at`, `merged_at`, `is_draft`, `base_ref`, `additions`/`deletions`/`changed_files` (GitHub's own counts),
+`comments`, `labels`, `merged_by`, and review figures: `review_count`, `approvals`, `changes_requested`,
+`first_review_at`, `approved_at`, `reviewers`. Reviews by the PR's author and pending reviews are left out, and only the
+first 20 reviews are read. No comment or review text is stored. Logins (`merged_by`, `reviewers`) are pseudonymized like
+authors, but a login is not linked to a git author, so the same person has different names in the two roles. If GitHub
+can't be reached, the dump is written without the field and a warning is printed.
+
 `--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `-R owner/repo` (or any git URL; repeatable) clones a repository into the system temp directory
 without file contents (a blobless clone over SSH for `owner/repo`) and deletes it when the run
 ends, so repositories you don't have on disk can be included; `--scan DIR` finds git checkouts

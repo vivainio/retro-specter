@@ -255,6 +255,13 @@ impl Repo {
             .collect())
     }
 
+    /// The URL of the `origin` remote, if there is one.
+    pub fn origin_url(&self) -> Option<String> {
+        self.run(&["remote", "get-url", "origin"])
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
     /// The upstream of the current branch (e.g. `origin/main`), if it has one.
     pub fn upstream(&self) -> Option<String> {
         self.run(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])

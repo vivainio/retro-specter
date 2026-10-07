@@ -15,6 +15,7 @@
 
 use crate::ai;
 use crate::git::{Commit, Repo};
+use crate::github::{self, PrInfo as GhInfo};
 use crate::pr;
 use crate::repos::RepoArgs;
 use anyhow::{Context, Result};
@@ -102,6 +103,9 @@ pub struct PrRec {
     /// The PR's title; only with `--titles`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// GitHub's data for the PR; only with `--github`, and only for PRs it knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GhInfo>,
 }
 
 /// Model and tool names credited by `c`'s message.
@@ -158,7 +162,32 @@ pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
     if args.unmerged {
         records.extend(unmerged_commits(repo, &name, args)?);
     }
+    if args.github {
+        // GitHub being unreachable shouldn't cost the git side of the dump.
+        match github_info(repo, args) {
+            Ok(info) => {
+                for r in &mut records {
+                    if let Record::Pr(p) = r {
+                        p.github = p.pr.and_then(|n| info.get(&n).cloned());
+                    }
+                }
+            }
+            Err(e) => eprintln!("{name}: no GitHub data: {e:#}"),
+        }
+    }
     Ok(records)
+}
+
+/// GitHub's details for the merged PRs of `repo`'s `origin` within the dump's window.
+fn github_info(repo: &Repo, args: &RepoArgs) -> Result<std::collections::HashMap<u64, GhInfo>> {
+    let url = repo.origin_url().context("no origin remote")?;
+    let (host, owner, name) =
+        github::parse_remote(&url).with_context(|| format!("{url} is not a GitHub remote"))?;
+    let since = match args.since_date() {
+        Some(s) => Some(github::iso(repo.since_timestamp(&s)?)),
+        None => None,
+    };
+    github::fetch(&host, &owner, &name, since.as_deref())
 }
 
 /// Commits on remote branches that the walked revision doesn't contain. A commit reachable
@@ -240,6 +269,7 @@ fn one(
             squash,
             tickets: tickets.clone(),
             title: titles.then(|| pr::title(c)),
+            github: None,
         })
     };
     if !merge {
@@ -345,7 +375,22 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
     }
     let mut order: Vec<(String, String)> = first.into_iter().map(|(k, d)| (d, k)).collect();
     order.sort();
-    let names = pseudonym_names(seed, order.len());
+    // GitHub logins (merger, reviewers) get names after the authors', so the two never clash.
+    // They are not linked to the authors: a login is not a git identity.
+    let mut logins: Vec<(String, String)> = Vec::new();
+    for r in groups.iter().flatten() {
+        if let Record::Pr(PrRec { date, github: Some(g), .. }) = r {
+            logins.extend(g.merged_by.iter().chain(&g.reviewers).map(|l| (date.clone(), l.clone())));
+        }
+    }
+    logins.sort();
+    logins.dedup_by(|b, a| a.1 == b.1);
+    let mut names = pseudonym_names(seed, order.len() + logins.len());
+    let login_names: std::collections::HashMap<String, String> = logins
+        .into_iter()
+        .map(|(_, l)| l)
+        .zip(names.split_off(order.len()))
+        .collect();
     let label: std::collections::HashMap<String, String> = order
         .into_iter()
         .zip(names)
@@ -356,6 +401,11 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
         let (_, author, email) = who(r);
         *author = label[&identity(author, email.as_deref().unwrap_or(""))].clone();
         *email = None;
+        if let Record::Pr(PrRec { github: Some(g), .. }) = r {
+            g.merged_by = g.merged_by.take().map(|l| login_names[&l].clone());
+            g.reviewers = g.reviewers.iter().map(|l| login_names[l].clone()).collect();
+            g.reviewers.sort();
+        }
     }
 }
 

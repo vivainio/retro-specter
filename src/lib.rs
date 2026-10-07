@@ -4,6 +4,7 @@ pub mod complexity;
 pub mod discover;
 pub mod dump;
 pub mod git;
+pub mod github;
 pub mod pr;
 pub mod report;
 pub mod repos;
