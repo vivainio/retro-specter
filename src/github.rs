@@ -202,6 +202,8 @@ fn is_transient(err: &str) -> bool {
         "timed out",
         "connection reset",
         "EOF",
+        // gh's message for a response cut off mid-body
+        "unexpected end of JSON",
     ]
     .iter()
     .any(|m| err.contains(m))
@@ -282,6 +284,7 @@ mod tests {
     fn page_shrinks_on_transient_errors_only() {
         assert_eq!(smaller_page(100, "gh: HTTP 502"), Some(50));
         assert_eq!(smaller_page(50, "unexpected EOF"), Some(25));
+        assert_eq!(smaller_page(100, "unexpected end of JSON input"), Some(50));
         assert_eq!(smaller_page(MIN_PAGE + 1, "HTTP 504"), Some(MIN_PAGE));
         assert_eq!(smaller_page(MIN_PAGE, "HTTP 502"), None);
         assert_eq!(smaller_page(100, "gh: HTTP 401 bad credentials"), None);
