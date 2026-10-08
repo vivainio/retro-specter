@@ -21,9 +21,9 @@ use crate::repos::RepoArgs;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
@@ -149,9 +149,26 @@ fn commit_rec(
     })
 }
 
+/// Repositories whose `--github` query failed, so their PRs lack GitHub data.
+static GITHUB_FAILED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Names of the repositories whose GitHub query failed during this run, sorted.
+pub fn github_failures() -> Vec<String> {
+    let mut v = GITHUB_FAILED.lock().unwrap().clone();
+    v.sort();
+    v
+}
+
 /// All records for `repo`, newest first; each PR is followed by its commits. With
 /// `--unmerged`, commits of unmerged remote branches follow.
-pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
+///
+/// `cached` holds GitHub data from an earlier dump, by PR number; only PRs missing from it are
+/// queried.
+pub fn dump_repo(
+    repo: &Repo,
+    args: &RepoArgs,
+    cached: &HashMap<u64, GhInfo>,
+) -> Result<Vec<Record>> {
     let name = repo.name();
     let items = args.select_with_direct(repo)?;
     let groups = items
@@ -164,30 +181,52 @@ pub fn dump_repo(repo: &Repo, args: &RepoArgs) -> Result<Vec<Record>> {
     }
     if args.github {
         // GitHub being unreachable shouldn't cost the git side of the dump.
-        match github_info(repo, args) {
+        // Merged PRs don't change much, so only those without cached data are queried.
+        let missing: Vec<&str> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Pr(p) if p.pr.is_some_and(|n| !cached.contains_key(&n)) => {
+                    Some(p.date.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let fetched = match missing.iter().min() {
+            None => Ok(HashMap::new()),
+            Some(oldest) => github_info(repo, oldest),
+        };
+        match fetched {
             Ok(info) => {
                 for r in &mut records {
                     if let Record::Pr(p) = r {
-                        p.github = p.pr.and_then(|n| info.get(&n).cloned());
+                        p.github = p.pr.and_then(|n| info.get(&n).or(cached.get(&n)).cloned());
                     }
                 }
             }
-            Err(e) => eprintln!("{name}: no GitHub data: {e:#}"),
+            Err(e) => {
+                eprintln!(
+                    "warning: {name}: GitHub query failed, PRs left without new github data: {e:#}"
+                );
+                GITHUB_FAILED.lock().unwrap().push(name.clone());
+                for r in &mut records {
+                    if let Record::Pr(p) = r {
+                        p.github = p.pr.and_then(|n| cached.get(&n).cloned());
+                    }
+                }
+            }
         }
     }
     Ok(records)
 }
 
-/// GitHub's details for the merged PRs of `repo`'s `origin` within the dump's window.
-fn github_info(repo: &Repo, args: &RepoArgs) -> Result<std::collections::HashMap<u64, GhInfo>> {
+/// GitHub's details for the merged PRs of `repo`'s `origin` merged since `oldest` (a PR's date).
+fn github_info(repo: &Repo, oldest: &str) -> Result<HashMap<u64, GhInfo>> {
     let url = repo.origin_url().context("no origin remote")?;
     let (host, owner, name) =
         github::parse_remote(&url).with_context(|| format!("{url} is not a GitHub remote"))?;
-    let since = match args.since_date() {
-        Some(s) => Some(github::iso(repo.since_timestamp(&s)?)),
-        None => None,
-    };
-    github::fetch(&host, &owner, &name, since.as_deref())
+    // A day of slack covers the date's UTC offset.
+    let since = github::iso(repo.since_timestamp(oldest)? - 86_400);
+    github::fetch(&host, &owner, &name, Some(&since))
 }
 
 /// Commits on remote branches that the walked revision doesn't contain. A commit reachable
@@ -218,7 +257,9 @@ fn unmerged_commits(repo: &Repo, name: &str, args: &RepoArgs) -> Result<Vec<Reco
             None,
         )?;
         for c in log.iter().filter(|c| seen.insert(c.id.clone())) {
-            let Record::Commit(mut rec) = commit_rec(name, c, None, None, Some(short), &[], args.titles) else {
+            let Record::Commit(mut rec) =
+                commit_rec(name, c, None, None, Some(short), &[], args.titles)
+            else {
                 unreachable!()
             };
             rec.unmerged = true;
@@ -283,11 +324,17 @@ fn one(
     let members = repo.commit_log(&format!("{base}..{}", c.id), None, None, None)?;
     let (added, removed) = repo.numstat(base, &c.id)?;
     let mut out = vec![pr_rec(added, removed, members.len() as u32, false)];
-    out.extend(
-        members
-            .iter()
-            .map(|m| commit_rec(name, m, Some(&c.id), pr, branch.as_deref(), &tickets, titles)),
-    );
+    out.extend(members.iter().map(|m| {
+        commit_rec(
+            name,
+            m,
+            Some(&c.id),
+            pr,
+            branch.as_deref(),
+            &tickets,
+            titles,
+        )
+    }));
     Ok(out)
 }
 
@@ -379,8 +426,18 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
     // They are not linked to the authors: a login is not a git identity.
     let mut logins: Vec<(String, String)> = Vec::new();
     for r in groups.iter().flatten() {
-        if let Record::Pr(PrRec { date, github: Some(g), .. }) = r {
-            logins.extend(g.merged_by.iter().chain(&g.reviewers).map(|l| (date.clone(), l.clone())));
+        if let Record::Pr(PrRec {
+            date,
+            github: Some(g),
+            ..
+        }) = r
+        {
+            logins.extend(
+                g.merged_by
+                    .iter()
+                    .chain(&g.reviewers)
+                    .map(|l| (date.clone(), l.clone())),
+            );
         }
     }
     logins.sort();
@@ -401,7 +458,10 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
         let (_, author, email) = who(r);
         *author = label[&identity(author, email.as_deref().unwrap_or(""))].clone();
         *email = None;
-        if let Record::Pr(PrRec { github: Some(g), .. }) = r {
+        if let Record::Pr(PrRec {
+            github: Some(g), ..
+        }) = r
+        {
             g.merged_by = g.merged_by.take().map(|l| login_names[&l].clone());
             g.reviewers = g.reviewers.iter().map(|l| login_names[l].clone()).collect();
             g.reviewers.sort();
@@ -548,4 +608,24 @@ mod tests {
         assert_eq!(c(&g[0][0]), (names[1].clone(), None));
         assert_eq!(c(&g[1][1]).0, names[1]);
     }
+}
+
+/// GitHub data already in the dump file at `path`, by PR number; empty when there is none.
+pub fn cached_github(path: &Path) -> HashMap<u64, GhInfo> {
+    let Ok(file) = fs::File::open(path) else {
+        return HashMap::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(|l| l.ok())
+        .filter_map(|l| serde_json::from_str::<Record>(&l).ok())
+        .filter_map(|r| match r {
+            Record::Pr(PrRec {
+                pr: Some(n),
+                github: Some(g),
+                ..
+            }) => Some((n, g)),
+            _ => None,
+        })
+        .collect()
 }

@@ -41,6 +41,11 @@ struct DumpArgs {
     #[arg(short, long, value_name = "DIR")]
     out_dir: Option<PathBuf>,
 
+    /// With `--github`, query every PR again instead of reusing the GitHub data already in the
+    /// `-o` files (labels and the like can change after a merge).
+    #[arg(long, requires = "github")]
+    refresh_github: bool,
+
     /// How authors appear in the dump.
     #[arg(long, value_enum, default_value_t = Authors::Pseudonym)]
     authors: Authors,
@@ -175,11 +180,25 @@ fn dump_cmd(cli: &DumpArgs) -> Result<()> {
         );
     }
     let mut used = std::collections::HashSet::new();
-    let files: Vec<String> = repos.iter().map(|r| dump::file_name(r, &mut used)).collect();
+    let files: Vec<String> = repos
+        .iter()
+        .map(|r| dump::file_name(r, &mut used))
+        .collect();
     // Repositories are independent, so dump them in parallel; order is kept.
+    // GitHub data from an earlier dump in `-o` is reused, unless `--refresh-github`.
+    let cached: Vec<_> = files
+        .iter()
+        .map(|f| match &cli.out_dir {
+            Some(dir) if cli.repos.github && !cli.refresh_github => {
+                dump::cached_github(&dir.join(f))
+            }
+            _ => Default::default(),
+        })
+        .collect();
     let results: Vec<_> = repos
         .par_iter()
-        .map(|repo| dump::dump_repo(repo, &cli.repos))
+        .zip(&cached)
+        .map(|(repo, cached)| dump::dump_repo(repo, &cli.repos, cached))
         .collect();
     let mut dumped = Vec::new(); // (repo name, file name, records)
     for ((repo, file), result) in repos.iter().zip(files).zip(results) {
@@ -215,6 +234,13 @@ fn dump_cmd(cli: &DumpArgs) -> Result<()> {
             }
         }
     }
+    let failed = dump::github_failures();
+    anyhow::ensure!(
+        failed.is_empty(),
+        "GitHub data is incomplete for {} repositories (dump written without it): {}",
+        failed.len(),
+        failed.join(", ")
+    );
     Ok(())
 }
 

@@ -73,7 +73,11 @@ pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
         return None;
     }
     // A host without a dot is an SSH config alias; the API lives at github.com.
-    let host = if host.contains('.') { host } else { "github.com".into() };
+    let host = if host.contains('.') {
+        host
+    } else {
+        "github.com".into()
+    };
     Some((host, owner.to_string(), name.to_string()))
 }
 
@@ -155,6 +159,44 @@ fn info(n: &Value) -> Option<(u64, PrInfo)> {
     Some((n["number"].as_u64()?, p))
 }
 
+/// Runs `gh` with `args`, retrying a few times with a growing pause when GitHub answers with a
+/// transient server error (502/503/504) or the connection fails.
+fn run_gh(args: &[String], owner: &str, name: &str) -> Result<std::process::Output> {
+    const ATTEMPTS: u32 = 4;
+    let mut attempt = 1;
+    loop {
+        let res = Command::new("gh")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run gh (is the GitHub CLI installed?)")?;
+        if res.status.success() {
+            return Ok(res);
+        }
+        let err = String::from_utf8_lossy(&res.stderr).trim().to_string();
+        if attempt < ATTEMPTS && is_transient(&err) {
+            std::thread::sleep(std::time::Duration::from_secs(2u64 << attempt));
+            attempt += 1;
+            continue;
+        }
+        bail!("gh api failed for {owner}/{name}: {err}");
+    }
+}
+
+fn is_transient(err: &str) -> bool {
+    [
+        "502",
+        "503",
+        "504",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "EOF",
+    ]
+    .iter()
+    .any(|m| err.contains(m))
+}
+
 /// Merged PRs of `owner/name` updated since `since` (an ISO time; all of them when `None`),
 /// by number. A merged PR is last updated at or after its merge, so every PR merged in the
 /// window is found.
@@ -167,23 +209,22 @@ pub fn fetch(
     let mut out = HashMap::new();
     let mut after: Option<String> = None;
     loop {
-        let mut cmd = Command::new("gh");
-        cmd.args(["api", "graphql", "--hostname", host])
-            .args(["-f", &format!("query={QUERY}")])
-            .args(["-F", &format!("owner={owner}"), "-F", &format!("name={name}")]);
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "--hostname".into(),
+            host.into(),
+            "-f".into(),
+            format!("query={QUERY}"),
+            "-F".into(),
+            format!("owner={owner}"),
+            "-F".into(),
+            format!("name={name}"),
+        ];
         if let Some(a) = &after {
-            cmd.args(["-F", &format!("after={a}")]);
+            args.extend(["-F".into(), format!("after={a}")]);
         }
-        let res = cmd
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to run gh (is the GitHub CLI installed?)")?;
-        if !res.status.success() {
-            bail!(
-                "gh api failed for {owner}/{name}: {}",
-                String::from_utf8_lossy(&res.stderr).trim()
-            );
-        }
+        let res = run_gh(&args, owner, name)?;
         let v: Value = serde_json::from_slice(&res.stdout).context("unreadable gh output")?;
         let prs = &v["data"]["repository"]["pullRequests"];
         let Some(nodes) = prs["nodes"].as_array() else {
@@ -249,10 +290,16 @@ mod tests {
         });
         let (num, p) = info(&n).unwrap();
         assert_eq!(num, 7);
-        assert_eq!((p.review_count, p.approvals, p.changes_requested), (3, 2, 1));
+        assert_eq!(
+            (p.review_count, p.approvals, p.changes_requested),
+            (3, 2, 1)
+        );
         assert_eq!(p.first_review_at.as_deref(), Some("2026-01-02T00:00:00Z"));
         assert_eq!(p.approved_at.as_deref(), Some("2026-01-02T12:00:00Z"));
         assert_eq!(p.reviewers, ["r1", "r2"]);
-        assert_eq!((p.merged_by.as_deref(), p.labels.as_slice()), (Some("m"), &["bug".to_string()][..]));
+        assert_eq!(
+            (p.merged_by.as_deref(), p.labels.as_slice()),
+            (Some("m"), &["bug".to_string()][..])
+        );
     }
 }

@@ -82,12 +82,18 @@ static TICKET: LazyLock<Regex> =
 /// are not tickets. Common non-ticket look-alikes (`UTF-8`, `SHA-256`) are ignored.
 pub fn tickets(branch: Option<&str>, texts: &[&str]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
-    let sources = branch.map(|b| (b, true)).into_iter().chain(texts.iter().map(|t| (*t, false)));
+    let sources = branch
+        .map(|b| (b, true))
+        .into_iter()
+        .chain(texts.iter().map(|t| (*t, false)));
     for (text, is_branch) in sources {
         for c in TICKET.captures_iter(text) {
             let project = &c[1];
             let keyed = project.len() >= 2
-                && (is_branch || project.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
+                && (is_branch
+                    || project
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
             let project = project.to_ascii_uppercase();
             if keyed && !NOT_PROJECTS.contains(&project.as_str()) {
                 let key = format!("{project}-{}", &c[2]);
@@ -158,8 +164,14 @@ mod tests {
     #[test]
     fn extracts_titles() {
         let t = |s, b| title(&commit(s, b));
-        assert_eq!(t("Merge pull request #4 from a/b", "\nFix the thing\n"), "Fix the thing");
-        assert_eq!(t("Merge pull request #4 from a/b", ""), "Merge pull request #4 from a/b");
+        assert_eq!(
+            t("Merge pull request #4 from a/b", "\nFix the thing\n"),
+            "Fix the thing"
+        );
+        assert_eq!(
+            t("Merge pull request #4 from a/b", ""),
+            "Merge pull request #4 from a/b"
+        );
         assert_eq!(t("Merged PR 12: Add x", ""), "Add x");
         assert_eq!(t("Fix the thing (#77)", "details"), "Fix the thing");
         assert_eq!(t("Plain commit", ""), "Plain commit");
@@ -170,7 +182,10 @@ mod tests {
         assert_eq!(tickets(Some("features/AC-2518-efs"), &[]), ["AC-2518"]);
         assert_eq!(tickets(Some("bt-19325"), &[]), ["BT-19325"]);
         assert_eq!(
-            tickets(Some("bt-1-x"), &["BT-19391: seller BT-33, BT-1", "see FOO-7"]),
+            tickets(
+                Some("bt-1-x"),
+                &["BT-19391: seller BT-33, BT-1", "see FOO-7"]
+            ),
             ["BT-1", "BT-19391", "BT-33", "FOO-7"]
         );
         // text needs upper case; look-alikes and plain issue numbers are not tickets

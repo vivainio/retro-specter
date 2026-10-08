@@ -3,8 +3,8 @@
 use anyhow::{Context, Result, bail};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 
 pub struct Repo {
     dir: PathBuf,
@@ -19,8 +19,7 @@ pub struct TempRoot(PathBuf);
 impl TempRoot {
     pub fn new() -> Result<TempRoot> {
         let dir = std::env::temp_dir().join(format!("retro-specter-{}", std::process::id()));
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(TempRoot(dir))
     }
 }
@@ -99,7 +98,13 @@ impl Repo {
             dir = root.0.join(format!("{name}-{n}"));
         }
         let out = Command::new("git")
-            .args(["clone", "--quiet", "--no-checkout", "--filter=blob:none", "--no-tags"])
+            .args([
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--filter=blob:none",
+                "--no-tags",
+            ])
             .arg(&url)
             .arg(&dir)
             .stdin(Stdio::null())
@@ -191,8 +196,13 @@ impl Repo {
     /// it asks the remote (`ls-remote --symref`). Never writes any ref.
     pub fn default_branch(&self, ask_remote: bool) -> Option<String> {
         let exists = |rev: &str| {
-            self.run(&["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
-                .is_ok()
+            self.run(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{rev}^{{commit}}"),
+            ])
+            .is_ok()
         };
         if let Ok(out) = self.run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
             let rev = out.trim().to_string();
@@ -203,7 +213,9 @@ impl Repo {
         if !ask_remote {
             return None;
         }
-        let out = self.run(&["ls-remote", "--symref", "origin", "HEAD"]).ok()?;
+        let out = self
+            .run(&["ls-remote", "--symref", "origin", "HEAD"])
+            .ok()?;
         let branch = out
             .lines()
             .find_map(|l| l.strip_prefix("ref: refs/heads/"))?

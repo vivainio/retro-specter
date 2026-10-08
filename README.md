@@ -123,6 +123,10 @@ Fields: `created_at`, `merged_at`, `is_draft`, `base_ref`, `additions`/`deletion
 first 20 reviews are read. No comment or review text is stored. Logins (`merged_by`, `reviewers`) are pseudonymized like
 authors, but a login is not linked to a git author, so the same person has different names in the two roles. If GitHub
 can't be reached, the dump is written without the field and a warning is printed.
+With `-o`, GitHub data already in the existing `<repo>.jsonl` is reused and only PRs without it are queried (the
+query stops at the oldest such PR, and is skipped when there are none), so rerunning after a failure is cheap.
+`--refresh-github` queries everything again. Reused logins are pseudonyms from the earlier run; they are renamed
+consistently, but a person's real login fetched now and the same person's cached pseudonym count as two people.
 
 `--months N` / `--days N` (dump time) limit the window (`--since`/`--until` also work); `-R owner/repo` (or any git URL; repeatable) clones a repository into the system temp directory
 without file contents (a blobless clone over SSH for `owner/repo`) and deletes it when the run
