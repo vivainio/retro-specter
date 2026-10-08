@@ -1,5 +1,5 @@
 //! Pull request details from the GitHub GraphQL API, through the `gh` CLI (so it reuses the
-//! user's authentication). One query returns up to 100 PRs with their reviews, which is far
+//! user's authentication). One query returns up to 100 PRs (fewer when GitHub answers 502 to a big page) with their reviews, which is far
 //! cheaper than per-PR REST calls.
 
 use anyhow::{Context, Result, bail};
@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 const QUERY: &str = "
-query($owner: String!, $name: String!, $after: String) {
+query($owner: String!, $name: String!, $after: String, $first: Int!) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: MERGED, first: 100, after: $after,
+    pullRequests(states: MERGED, first: $first, after: $after,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
@@ -159,10 +159,20 @@ fn info(n: &Value) -> Option<(u64, PrInfo)> {
     Some((n["number"].as_u64()?, p))
 }
 
-/// Runs `gh` with `args`, retrying a few times with a growing pause when GitHub answers with a
-/// transient server error (502/503/504) or the connection fails.
-fn run_gh(args: &[String], owner: &str, name: &str) -> Result<std::process::Output> {
-    const ATTEMPTS: u32 = 4;
+/// PRs asked for per query, and the smallest page worth trying. A repository whose PRs carry many
+/// reviews can make a 100-PR response too large for GitHub, which then answers 502 every time.
+const PAGE: u32 = 100;
+const MIN_PAGE: u32 = 6;
+
+/// Page size to retry with after a failed query, or `None` when a smaller page won't help
+/// (the error is not transient, or the page is already as small as it gets).
+fn smaller_page(page: u32, err: &str) -> Option<u32> {
+    (page > MIN_PAGE && is_transient(err)).then(|| (page / 2).max(MIN_PAGE))
+}
+
+/// Runs `gh` with `args`, retrying up to `attempts` times with a growing pause when GitHub answers
+/// with a transient server error (502/503/504) or the connection fails.
+fn run_gh(args: &[String], owner: &str, name: &str, attempts: u32) -> Result<std::process::Output> {
     let mut attempt = 1;
     loop {
         let res = Command::new("gh")
@@ -174,7 +184,7 @@ fn run_gh(args: &[String], owner: &str, name: &str) -> Result<std::process::Outp
             return Ok(res);
         }
         let err = String::from_utf8_lossy(&res.stderr).trim().to_string();
-        if attempt < ATTEMPTS && is_transient(&err) {
+        if attempt < attempts && is_transient(&err) {
             std::thread::sleep(std::time::Duration::from_secs(2u64 << attempt));
             attempt += 1;
             continue;
@@ -208,6 +218,7 @@ pub fn fetch(
 ) -> Result<HashMap<u64, PrInfo>> {
     let mut out = HashMap::new();
     let mut after: Option<String> = None;
+    let mut page = PAGE;
     loop {
         let mut args = vec![
             "api".to_string(),
@@ -220,11 +231,28 @@ pub fn fetch(
             format!("owner={owner}"),
             "-F".into(),
             format!("name={name}"),
+            "-F".into(),
+            format!("first={page}"),
         ];
         if let Some(a) = &after {
             args.extend(["-F".into(), format!("after={a}")]);
         }
-        let res = run_gh(&args, owner, name)?;
+        // Fewer retries per size while there is a smaller size to fall back to; the cursor stays
+        // valid at any page size, so the same page is simply asked for in smaller pieces.
+        let attempts = if page > MIN_PAGE { 2 } else { 4 };
+        let res = match run_gh(&args, owner, name, attempts) {
+            Ok(res) => res,
+            Err(e) => match smaller_page(page, &e.to_string()) {
+                Some(smaller) => {
+                    eprintln!(
+                        "{owner}/{name}: GitHub failed at {page} PRs per query, trying {smaller}"
+                    );
+                    page = smaller;
+                    continue;
+                }
+                None => return Err(e),
+            },
+        };
         let v: Value = serde_json::from_slice(&res.stdout).context("unreadable gh output")?;
         let prs = &v["data"]["repository"]["pullRequests"];
         let Some(nodes) = prs["nodes"].as_array() else {
@@ -249,6 +277,15 @@ pub fn fetch(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn page_shrinks_on_transient_errors_only() {
+        assert_eq!(smaller_page(100, "gh: HTTP 502"), Some(50));
+        assert_eq!(smaller_page(50, "unexpected EOF"), Some(25));
+        assert_eq!(smaller_page(MIN_PAGE + 1, "HTTP 504"), Some(MIN_PAGE));
+        assert_eq!(smaller_page(MIN_PAGE, "HTTP 502"), None);
+        assert_eq!(smaller_page(100, "gh: HTTP 401 bad credentials"), None);
+    }
 
     #[test]
     fn remotes() {
