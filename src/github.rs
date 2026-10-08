@@ -1,6 +1,6 @@
 //! Pull request details from the GitHub GraphQL API, through the `gh` CLI (so it reuses the
-//! user's authentication). One query returns up to 100 PRs (fewer when GitHub answers 502 to a big page) with their reviews, which is far
-//! cheaper than per-PR REST calls.
+//! user's authentication). One query returns up to 100 PRs (fewer when GitHub answers 502 to a
+//! big page) with their reviews, which is far cheaper than per-PR REST calls.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
