@@ -46,7 +46,8 @@ jobs:
       - name: Set version from tag
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}" perl -pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/ and $done++ unless $done' Cargo.toml
+          cargo install cargo-edit --locked
+          cargo set-version "${GITHUB_REF_NAME#v}"
           grep -m1 '^version' Cargo.toml
 
       - name: Test
