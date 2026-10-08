@@ -42,6 +42,13 @@ jobs:
           key: ${{ matrix.target }}
 
       # The tests need a native binary, so only run them where the target is the host's.
+      # Cargo.toml carries 0.0.0-dev; the release version comes from the tag.
+      - name: Set version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}" perl -pi -e 's/^version = ".*"/version = "$ENV{VERSION}"/ and $done++ unless $done' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
       - name: Test
         if: matrix.target != 'x86_64-apple-darwin'
         run: cargo test --release --target ${{ matrix.target }}
