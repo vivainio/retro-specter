@@ -71,6 +71,10 @@ pub struct CommitRec {
     /// revision; `branch` names it. Merged and direct commits omit the field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unmerged: bool,
+    /// The author is a bot account; only written when true (with `--no-bots` such records are
+    /// dropped instead).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bot: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +110,10 @@ pub struct PrRec {
     /// GitHub's data for the PR; only with `--github`, and only for PRs it knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GhInfo>,
+    /// The author is a bot account; only written when true (with `--no-bots` such records are
+    /// dropped instead).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bot: bool,
 }
 
 /// Model and tool names credited by `c`'s message.
@@ -146,6 +154,7 @@ fn commit_rec(
         tickets,
         subject: titles.then(|| c.subject.clone()),
         unmerged: false,
+        bot: false,
     })
 }
 
@@ -216,7 +225,49 @@ pub fn dump_repo(
             }
         }
     }
-    Ok(records)
+    Ok(handle_bots(records, &name, args.no_bots))
+}
+
+/// Sets `bot` on PRs opened by a bot and on commits made by one or belonging to such a PR.
+fn mark_bots(records: &mut [Record]) {
+    let bot_prs: std::collections::HashSet<String> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Pr(p)
+                if is_bot(&p.author, p.author_email.as_deref().unwrap_or(""))
+                    || p.github.as_ref().is_some_and(|g| g.author_bot) =>
+            {
+                Some(p.sha.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for r in records {
+        match r {
+            Record::Pr(p) => p.bot = bot_prs.contains(&p.sha),
+            Record::Commit(c) => {
+                c.bot = is_bot(&c.author, c.author_email.as_deref().unwrap_or(""))
+                    || c.pr_merge.as_ref().is_some_and(|m| bot_prs.contains(m));
+            }
+        }
+    }
+}
+
+/// Marks bots, then drops them when `drop` is set (`--no-bots`).
+fn handle_bots(mut records: Vec<Record>, repo: &str, drop: bool) -> Vec<Record> {
+    mark_bots(&mut records);
+    if !drop {
+        return records;
+    }
+    let before = records.len();
+    records.retain(|r| match r {
+        Record::Pr(p) => !p.bot,
+        Record::Commit(c) => !c.bot,
+    });
+    if records.len() < before {
+        eprintln!("{repo}: left out {} bot records", before - records.len());
+    }
+    records
 }
 
 /// GitHub's details for the merged PRs of `repo`'s `origin` merged since `oldest` (a PR's date).
@@ -311,6 +362,7 @@ fn one(
             tickets: tickets.clone(),
             title: titles.then(|| pr::title(c)),
             github: None,
+            bot: false,
         })
     };
     if !merge {
@@ -339,6 +391,12 @@ fn one(
 }
 
 /// Identity key: the lowercased email, or the lowercased name when there is none.
+/// A git identity that belongs to a bot account (`dependabot[bot]`, `github-actions[bot]`).
+/// Bots are tools, not people, so they keep their names when authors are pseudonymized.
+fn is_bot(name: &str, email: &str) -> bool {
+    name.to_lowercase().contains("[bot]") || email.to_lowercase().contains("[bot]")
+}
+
 fn identity(name: &str, email: &str) -> String {
     if email.is_empty() { name } else { email }.to_lowercase()
 }
@@ -411,6 +469,9 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
     let mut first: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for r in groups.iter_mut().flatten() {
         let (date, author, email) = who(r);
+        if is_bot(author, email.as_deref().unwrap_or("")) {
+            continue;
+        }
         let (date, key) = (
             date.to_string(),
             identity(author, email.as_deref().unwrap_or("")),
@@ -435,7 +496,14 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
             logins.extend(
                 g.merged_by
                     .iter()
+                    .filter(|_| !g.merged_by_bot)
                     .chain(&g.reviewers)
+                    .chain(
+                        g.timeline
+                            .iter()
+                            .filter(|e| e.by.as_deref() == Some("human"))
+                            .filter_map(|e| e.who.as_ref()),
+                    )
                     .map(|l| (date.clone(), l.clone())),
             );
         }
@@ -456,15 +524,24 @@ pub fn pseudonymize(groups: &mut [Vec<Record>], seed: u64) {
 
     for r in groups.iter_mut().flatten() {
         let (_, author, email) = who(r);
-        *author = label[&identity(author, email.as_deref().unwrap_or(""))].clone();
+        if !is_bot(author, email.as_deref().unwrap_or("")) {
+            *author = label[&identity(author, email.as_deref().unwrap_or(""))].clone();
+        }
         *email = None;
         if let Record::Pr(PrRec {
             github: Some(g), ..
         }) = r
         {
-            g.merged_by = g.merged_by.take().map(|l| login_names[&l].clone());
+            if !g.merged_by_bot {
+                g.merged_by = g.merged_by.take().map(|l| login_names[&l].clone());
+            }
             g.reviewers = g.reviewers.iter().map(|l| login_names[l].clone()).collect();
             g.reviewers.sort();
+            for e in &mut g.timeline {
+                if e.by.as_deref() == Some("human") {
+                    e.who = e.who.take().map(|l| login_names[&l].clone());
+                }
+            }
         }
     }
 }
@@ -569,7 +646,91 @@ mod tests {
             tickets: vec![],
             subject: None,
             unmerged: false,
+            bot: false,
         })
+    }
+
+    fn pr_by(sha: &str, name: &str, bot_on_github: bool) -> Record {
+        Record::Pr(PrRec {
+            repo: "r".into(),
+            sha: sha.into(),
+            pr: Some(1),
+            branch: None,
+            author: name.into(),
+            author_email: None,
+            date: "2026-01-01".into(),
+            ai_models: vec![],
+            ai_tools: vec![],
+            added: 0,
+            removed: 0,
+            commits: 1,
+            squash: false,
+            tickets: vec![],
+            title: None,
+            github: Some(GhInfo {
+                author_bot: bot_on_github,
+                ..GhInfo::default()
+            }),
+            bot: false,
+        })
+    }
+
+    #[test]
+    fn no_bots_drops_bot_prs_their_commits_and_bot_commits() {
+        let member = |sha: &str, pr: &str, name: &str| match commit(sha, "2026-01-01", name, "") {
+            Record::Commit(mut c) => {
+                c.pr_merge = Some(pr.into());
+                Record::Commit(c)
+            }
+            r => r,
+        };
+        let records = vec![
+            pr_by("p1", "Ann A", false),
+            pr_by("p2", "Ann A", true), // a human-looking git author, but GitHub says a bot opened it
+            pr_by("p3", "dependabot[bot]", false),
+            member("c1", "p1", "Ann A"),
+            member("c2", "p2", "Ann A"),
+            member("c3", "p1", "renovate[bot]"),
+            commit("c4", "2026-01-01", "github-actions[bot]", ""),
+            commit("c5", "2026-01-01", "Bob B", "bob@x.com"),
+        ];
+        let kept: Vec<String> = handle_bots(records, "r", true)
+            .iter()
+            .map(|r| match r {
+                Record::Pr(p) => p.sha.clone(),
+                Record::Commit(c) => c.sha.clone(),
+            })
+            .collect();
+        assert_eq!(kept, ["p1", "c1", "c5"]);
+    }
+
+    #[test]
+    fn bots_are_flagged_when_kept() {
+        let records = vec![
+            pr_by("p1", "Ann A", false),
+            pr_by("p2", "dependabot[bot]", false),
+            commit("c1", "2026-01-01", "Bob B", "bob@x.com"),
+            commit("c2", "2026-01-01", "github-actions[bot]", ""),
+        ];
+        let flags: Vec<(String, bool)> = handle_bots(records, "r", false)
+            .iter()
+            .map(|r| match r {
+                Record::Pr(p) => (p.sha.clone(), p.bot),
+                Record::Commit(c) => (c.sha.clone(), c.bot),
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("p1".into(), false),
+                ("p2".into(), true),
+                ("c1".into(), false),
+                ("c2".into(), true)
+            ]
+        );
+        // and the flag is written only when true
+        let json = serde_json::to_string(&commit("c", "2026-01-01", "x[bot]", "")).unwrap();
+        assert!(!json.contains("\"bot\""));
     }
 
     #[test]
@@ -586,6 +747,65 @@ mod tests {
         assert_ne!(pseudonym_names(7, 5), pseudonym_names(8, 5));
         // no word can look like an AI vendor to the credit detector
         assert!(names.iter().all(|x| !ai::is_ai_identity(x, "")));
+    }
+
+    #[test]
+    fn timeline_people_are_pseudonymized_and_bots_kept() {
+        let mut p = match pr_by("p1", "Ann A", false) {
+            Record::Pr(p) => p,
+            _ => unreachable!(),
+        };
+        let ev = |kind: &str, by: &str, who: &str| crate::github::Event {
+            at: "2026-01-01T00:00:00Z".into(),
+            kind: kind.into(),
+            by: Some(by.into()),
+            who: Some(who.into()),
+            ..Default::default()
+        };
+        let g = p.github.as_mut().unwrap();
+        g.timeline = vec![
+            ev("review", "human", "alice-gh"),
+            ev("review", "bot", "copilot"),
+            ev("comment", "human", "bob-gh"),
+        ];
+        let mut groups = vec![vec![Record::Pr(p)]];
+        pseudonymize(&mut groups, 7);
+        let Record::Pr(p) = &groups[0][0] else {
+            unreachable!()
+        };
+        let who: Vec<&str> = p
+            .github
+            .as_ref()
+            .unwrap()
+            .timeline
+            .iter()
+            .map(|e| e.who.as_deref().unwrap())
+            .collect();
+        assert_ne!(who[0], "alice-gh");
+        assert_eq!(who[1], "copilot");
+        assert_ne!(who[2], "bob-gh");
+        assert_ne!(who[0], who[2]);
+    }
+
+    #[test]
+    fn bots_keep_their_names() {
+        let mut g = vec![vec![
+            commit(
+                "1",
+                "2026-01-01",
+                "dependabot[bot]",
+                "49699333+dependabot[bot]@users.noreply.github.com",
+            ),
+            commit("2", "2026-02-01", "Ann A", "ann@x.com"),
+        ]];
+        pseudonymize(&mut g, 7);
+        let c = |r: &Record| match r {
+            Record::Commit(c) => (c.author.clone(), c.author_email.clone()),
+            _ => unreachable!(),
+        };
+        // the bot is not a person: name kept, email dropped, and it takes no pseudonym
+        assert_eq!(c(&g[0][0]), ("dependabot[bot]".to_string(), None));
+        assert_eq!(c(&g[0][1]), (pseudonym_names(7, 1)[0].clone(), None));
     }
 
     #[test]

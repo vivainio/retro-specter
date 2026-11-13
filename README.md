@@ -116,13 +116,46 @@ tools from `Generated with …` lines. Reads files or directories of `*.jsonl` (
 
 `--github` (dump) adds a `github` object to `pr` records from the GitHub GraphQL API, via `gh api graphql`
 (so it needs an authenticated `gh`; the repository's `origin` must be on GitHub, and an SSH host alias without a dot
-counts as github.com). One query fetches 100 PRs, newest-updated first, and stops once past the window.
+counts as github.com). One query fetches up to 100 PRs, newest-updated first, and stops once past the window; when
+GitHub answers 502 to a big page, the page size is halved and the same page retried. Once a repository has had to shrink
+its pages, later repositories start at that size (not below 25), so the run does not rediscover it for each one.
+Queries run one at a time; a `gh` call that takes over 3 minutes is killed and retried, a GitHub rate limit is waited
+out (60 s, 120 s, ...) rather than failing the repository, and a repository still paging after 20 minutes gives up and
+is reported as incomplete (the dump is written without its GitHub data).
 Fields: `created_at`, `merged_at`, `is_draft`, `base_ref`, `additions`/`deletions`/`changed_files` (GitHub's own counts),
-`comments`, `labels`, `merged_by`, and review figures: `review_count`, `approvals`, `changes_requested`,
-`first_review_at`, `approved_at`, `reviewers`. Reviews by the PR's author and pending reviews are left out, and only the
-first 20 reviews are read. No comment or review text is stored. Logins (`merged_by`, `reviewers`) are pseudonymized like
-authors, but a login is not linked to a git author, so the same person has different names in the two roles. If GitHub
-can't be reached, the dump is written without the field and a warning is printed.
+`comments`, `labels`, `merged_by`, `author_bot` and `merged_by_bot` (only when true), and review figures.
+Reviews by the PR's author and pending reviews are left out, and only the first 50 reviews are read. No comment or
+review text is stored.
+
+Bots are told apart from people (GitHub types an account as `Bot`, e.g. an automated code reviewer), because a bot
+reviews in minutes and would hide how long people take:
+
+- `review_count`, `approvals`, `changes_requested`, `first_review_at`, `approved_at`: every reviewer, bots included.
+- `human_review_count`, `human_approvals`, `human_changes_requested`, `first_human_review_at`, `human_approved_at`:
+  people only. `review_comments`: inline comments people left, summed over their reviews.
+- `bot_review_count`, `first_bot_review_at`, `bot_approvals`, `bot_changes_requested`, `bot_review_comments`: what the
+  bots did, summed over every bot.
+- `reviewers`: distinct people; `bot_reviewers`: distinct bots. Logins of people (`reviewers`, `merged_by`) are
+  pseudonymized like authors, but a login is not linked to a git author, so the same person has different names in the
+  two roles. **Bots keep their real names** (`bot_reviewers`, a bot `merged_by`, a bot git author): they are tools.
+- Timing: `ready_at` (when a PR that began as a draft was last marked ready for review; absent otherwise) and
+  `first_review_requested_at`.
+- Rework: `commit_count`, `last_commit_at` (newest commit's committed time; a rebase moves it),
+  `commits_after_review` and `lines_after_review` (commits authored after the first *human* review, and the lines they
+  change; absent when no person reviewed the PR; only the last 100 commits are read, and a rebase keeps author dates, so
+  force-pushed rework is missed).
+
+- `timeline`: everything that happened on the PR, oldest first (at most 400 events), for drawing a timeline or
+  counting back-and-forth. Each event has `at` and `kind` (`opened`, `ready`, `review_requested`, `review`, `comment`,
+  `commit`, `force_push`, `merged`); reviews and comments add `by` (`bot` or `human`) and `who` (people pseudonymized,
+  bots by name); a review adds `state` and `n` (its inline comments); a commit adds `n` (changed lines); `author` is
+  true for the PR author's own reviews and comments. Commit times are committed dates, so a rebase moves them;
+  only the first 30 comments, 50 reviews, 100 commits and 100 timeline items are read.
+
+Bot-authored PRs and commits (a git author like `dependabot[bot]`, or a PR GitHub says a bot opened, with `--github`)
+are kept and carry `"bot": true` (written only when true), as do the commits of such a PR, so consumers can filter them.
+`--no-bots` (dump) drops those records instead. If GitHub can't be reached, the dump is
+written without the field and a warning is printed.
 With `-o`, GitHub data already in the existing `<repo>.jsonl` is reused and only PRs without it are queried (the
 query stops at the oldest such PR, and is skipped when there are none), so rerunning after a failure is cheap.
 `--refresh-github` queries everything again. Reused logins are pseudonyms from the earlier run; they are renamed

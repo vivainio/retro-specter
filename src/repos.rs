@@ -65,6 +65,13 @@ pub struct RepoArgs {
     #[arg(long)]
     pub github: bool,
 
+    /// `dump` only: leave out bots. PRs and commits whose author is a bot account
+    /// (`dependabot[bot]`, or a PR GitHub says a bot opened with `--github`) are dropped, along
+    /// with the commits of a dropped PR. Bots keep their real names in what is left (reviewers,
+    /// mergers), as they are tools, not people.
+    #[arg(long)]
+    pub no_bots: bool,
+
     /// Maximum number of PRs per repository (newest first).
     #[arg(short = 'n', long)]
     pub max_count: Option<usize>,
